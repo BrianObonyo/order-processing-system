@@ -1,0 +1,107 @@
+# order-processing-system
+
+A distributed backend system designed to reliably manage order lifecycles, inventory reservations and payment workflows under concurrent traffic and service failures.
+
+Built with Go, Gin, PostgreSQL (pgx), Redis and Apache Kafka. A modular monolith: one deployable, clearly separated modules (order, inventory, payment, recovery).
+
+## Quick start
+
+Requirements: Go 1.27.4 for local development and Docker Desktop for the full service stack. `make` is optional; the equivalent Docker Compose commands are shown below.
+
+```bash
+make up        # Postgres, Redis, Kafka, API, Prometheus, Grafana
+make seed      # two demo products
+```
+
+On Windows, run `docker compose up -d --build` and `Get-Content scripts/seed.sql | docker compose exec -T postgres psql -U orders -d orders` instead.
+
+```bash
+# List products and live availability
+curl -s localhost:8080/api/v1/products -H 'X-API-Key: dev-key-1'
+
+# Create an order (the Idempotency-Key header is required)
+curl -s -X POST localhost:8080/api/v1/orders \
+  -H 'X-API-Key: dev-key-1' \
+  -H 'Idempotency-Key: demo-order-0001' \
+  -H 'Content-Type: application/json' \
+  -d '{"items":[{"product_id":"11111111-1111-1111-1111-111111111111","quantity":2}]}'
+
+# Repeat the exact same request: 200 + same order, nothing is reserved twice
+# Poll the order: PENDING_PAYMENT -> PAID (or CANCELLED)
+curl -s localhost:8080/api/v1/orders/<id> -H 'X-API-Key: dev-key-1'
+```
+
+Prometheus: http://localhost:9090, Grafana: http://localhost:3000 (Prometheus datasource preconfigured), metrics: `/metrics`.
+
+To run the API on your host instead, start the dependencies with `docker compose up -d postgres redis kafka`, apply migrations with `docker compose run --rm migrate`, then stop the containerized API. In PowerShell, load the example environment and start the host process:
+
+```powershell
+Copy-Item .env.example .env
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^\s*([^#\s=]+)\s*=(.*)$') {
+    Set-Item -Path "Env:$($matches[1])" -Value $matches[2].Trim()
+  }
+}
+docker compose stop api
+go run ./cmd/api
+```
+
+The Go process does not load `.env` files automatically; the commands above set those values in the current PowerShell session.
+
+## Order lifecycle
+
+```
+POST /orders ──► PENDING_PAYMENT ──► PAID
+                      │
+                      └────────────► CANCELLED   (payment declined, or payment timed out)
+```
+
+1. **API** (one DB transaction): claim the idempotency key, reserve stock, insert the order, write an `order.created` row to the outbox.
+2. **Outbox relay** publishes outbox rows to Kafka and marks them published.
+3. **Payment consumer** reads `order.created`, charges the order through a simulated gateway (retries + circuit breaker).
+4. **Success**: stock reservation becomes a real deduction, order becomes `PAID`. **Decline**: reservation released, order `CANCELLED`.
+5. **Recovery worker** re-emits events for stalled orders, cancels orders that stay pending past the timeout, and refunds a payment that succeeds after its order was cancelled.
+
+## How each objective is met
+
+| Objective | Mechanism |
+|---|---|
+| Prevent overselling | One atomic `UPDATE inventory SET reserved = reserved + n WHERE on_hand - reserved >= n`; `CHECK` constraints as a backstop; stock rows locked in sorted order (no deadlocks). PostgreSQL is the source of truth, Redis never decides stock. |
+| Prevent duplicate orders | `Idempotency-Key` is claimed inside the order transaction (primary key `(user_id, key)`). Concurrent duplicates block on the unique index and then replay the stored order. Same key with a different body returns 422. |
+| Prevent duplicate payments | `UNIQUE (order_id)` on `payments`; gateway calls are keyed by payment ID; outcome applied with a compare-and-set on order status. |
+| Handle concurrent requests | Row-level locks, atomic updates, `FOR UPDATE SKIP LOCKED` in the relay, Redis lock to cheaply reject in-flight duplicates (fails open). |
+| Recover from failures | Transactional outbox (no lost events), at-least-once consumers that are idempotent, retry with backoff, circuit breaker, recovery worker with retry budget and timeout compensation. |
+| Consistent state across async steps | Every state change and its event commit in one transaction; every transition is guarded by a lock and a status re-check. |
+
+## Layout
+
+```
+cmd/api                 entrypoint and wiring
+internal/domain         order, inventory, payment: pure types and rules
+internal/services       use cases, each owning its transaction
+internal/repositories   all SQL (pgx)
+internal/handlers       Gin handlers and router
+internal/middleware     API-key auth, idempotency, metrics
+internal/messaging      broker-agnostic types, outbox relay
+internal/workers        payment consumer, recovery worker
+internal/infrastructure postgres, redis, kafka
+migrations/             golang-migrate SQL
+tests/                  integration, concurrency, failure (Testcontainers)
+```
+
+## Testing
+
+```bash
+make test               # unit tests
+make test-integration   # needs Docker; real PostgreSQL via Testcontainers
+make loadtest           # k6: 100 orders/s plus 50 buyers fighting over 10 units
+```
+
+The integration suite proves the hard guarantees: 100 concurrent buyers on 10 units produce exactly 10 orders, 20 parallel requests with one key produce one order, duplicate event delivery produces one payment, a failed order rolls back stock and key together, and a stale order is cancelled with stock released.
+
+## Notes
+
+- Delivery is at-least-once everywhere; idempotency makes it effectively-once.
+- Rejected requests (for example out of stock) roll back completely, including the idempotency key, so a client retry re-evaluates against current stock.
+- Authentication is a static API-key map for development. Replace `middleware.APIKeyAuth` with JWT/OIDC for real use.
+- `pgx` is used directly. sqlc can replace the hand-written `internal/repositories` later without touching services.
