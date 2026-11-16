@@ -13,6 +13,7 @@ import (
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/messaging"
+	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 	"github.com/BrianObonyo/order-processing-system/internal/services"
 	"github.com/BrianObonyo/order-processing-system/tests/testutil"
 )
@@ -110,12 +111,12 @@ func TestPaymentSuccessAndDuplicateDelivery(t *testing.T) {
 	if onHand, reserved := testutil.Stock(t, pool, product); onHand != 6 || reserved != 0 {
 		t.Fatalf("on_hand=%d reserved=%d, want 6/0", onHand, reserved)
 	}
-	if n := testutil.Count(t, pool, `SELECT count(*) FROM payments`); n != 1 {
-		t.Fatalf("payments=%d, want exactly 1", n)
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM payment_attempts`); n != 1 {
+		t.Fatalf("payment attempts=%d, want exactly 1", n)
 	}
 }
 
-func TestPaymentDeclinedReleasesStock(t *testing.T) {
+func TestPaymentDeclinedLeavesOrderRetryable(t *testing.T) {
 	pool := testutil.StartPostgres(t)
 	orders := services.NewOrderService(pool)
 	payments := services.NewPaymentService(pool, testutil.StubGateway{Err: payment.ErrDeclined})
@@ -128,11 +129,78 @@ func TestPaymentDeclinedReleasesStock(t *testing.T) {
 	}
 
 	got, _ := orders.GetOrder(context.Background(), "user-1", res.Order.ID)
-	if got.Status != order.StatusCancelled {
-		t.Fatalf("status=%s, want CANCELLED", got.Status)
+	if got.Status != order.StatusPendingPayment {
+		t.Fatalf("status=%s, want PENDING_PAYMENT for another payment attempt", got.Status)
 	}
-	if onHand, reserved := testutil.Stock(t, pool, product); onHand != 10 || reserved != 0 {
-		t.Fatalf("on_hand=%d reserved=%d, want 10/0", onHand, reserved)
+	if onHand, reserved := testutil.Stock(t, pool, product); onHand != 10 || reserved != 4 {
+		t.Fatalf("on_hand=%d reserved=%d, want 10/4 while retry is possible", onHand, reserved)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM payment_attempts WHERE order_id = $1 AND status = 'FAILED'`, res.Order.ID); n != 1 {
+		t.Fatalf("failed attempts=%d, want 1", n)
+	}
+}
+
+func TestPaymentRetryCreatesNewAttemptAndKeepsHistory(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	orders := services.NewOrderService(pool)
+	gateway := &sequenceGateway{outcomes: []error{payment.ErrDeclined, nil}}
+	payments := services.NewPaymentService(pool, gateway)
+	product := testutil.SeedProduct(t, pool, 10)
+
+	res, err := orders.CreateOrder(context.Background(), "user-1", "key-payment-retry-1",
+		[]order.CreateItem{{ProductID: product, Quantity: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := payments.ProcessOrder(context.Background(), res.Order.ID); err != nil {
+		t.Fatalf("first ProcessOrder err=%v, want nil for decline outcome", err)
+	}
+
+	first := testutil.Count(t, pool, `SELECT count(*) FROM payment_attempts WHERE order_id = $1 AND attempt_number = 1 AND status = 'FAILED'`, res.Order.ID)
+	if first != 1 {
+		t.Fatalf("failed first attempt rows=%d, want 1", first)
+	}
+	retry, err := payments.RetryPayment(context.Background(), res.Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.AttemptNumber != 2 || retry.Status != payment.StatusProcessing {
+		t.Fatalf("retry=%+v, want attempt 2 in PROCESSING", retry)
+	}
+	if err := payments.ProcessOrder(context.Background(), res.Order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM payment_attempts WHERE order_id = $1`, res.Order.ID); n != 2 {
+		t.Fatalf("attempts=%d, want 2", n)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM payment_attempts WHERE order_id = $1 AND status = 'SUCCEEDED'`, res.Order.ID); n != 1 {
+		t.Fatalf("successful attempts=%d, want 1", n)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM order_status_history WHERE order_id = $1 AND from_status = 'PENDING_PAYMENT' AND to_status = 'PAID'`, res.Order.ID); n != 1 {
+		t.Fatalf("PENDING_PAYMENT -> PAID history rows=%d, want 1", n)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM outbox WHERE aggregate_id = $1 AND event_type = 'order.created'`, res.Order.ID); n != 2 {
+		t.Fatalf("order.created events=%d, want original and payment retry", n)
+	}
+}
+
+func TestSetOrderStatusRejectsInvalidTransitionWithoutHistory(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	orders := services.NewOrderService(pool)
+	product := testutil.SeedProduct(t, pool, 1)
+	res, err := orders.CreateOrder(context.Background(), "user-1", "key-status-history-1",
+		[]order.CreateItem{{ProductID: product, Quantity: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := repositories.New(pool).SetOrderStatus(
+		context.Background(), res.Order.ID, order.StatusPaid, order.StatusCancelled, "invalid")
+	if !errors.Is(err, order.ErrInvalidTransition) || changed {
+		t.Fatalf("invalid transition changed=%t err=%v, want false and ErrInvalidTransition", changed, err)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM order_status_history WHERE order_id = $1`, res.Order.ID); n != 1 {
+		t.Fatalf("status history rows=%d after rejection, want 1 initial entry", n)
 	}
 }
 
@@ -140,6 +208,28 @@ type recordingPublisher struct {
 	mu   sync.Mutex
 	msgs []messaging.Message
 }
+
+type sequenceGateway struct {
+	outcomes []error
+	next     int
+}
+
+func (g *sequenceGateway) Charge(context.Context, string, int64) error {
+	outcome := g.outcomes[g.next]
+	g.next++
+	return outcome
+}
+
+func (*sequenceGateway) Refund(context.Context, string, int64) error { return nil }
+
+func (g *sequenceGateway) GetCharge(context.Context, string) (payment.ChargeStatus, error) {
+	if g.next > 0 && g.outcomes[g.next-1] == nil {
+		return payment.ChargeStatusSucceeded, nil
+	}
+	return payment.ChargeStatusDeclined, nil
+}
+
+var _ payment.Gateway = (*sequenceGateway)(nil)
 
 func (p *recordingPublisher) Publish(_ context.Context, m []messaging.Message) error {
 	p.mu.Lock()

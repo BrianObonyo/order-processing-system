@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,7 +31,13 @@ func scanOrder(row pgx.Row) (*order.Order, error) {
 
 func (q *Queries) InsertOrder(ctx context.Context, o *order.Order) error {
 	_, err := q.db.Exec(ctx,
-		`INSERT INTO orders (id, user_id, status, total_cents) VALUES ($1, $2, $3, $4)`,
+		`WITH inserted AS (
+			INSERT INTO orders (id, user_id, status, total_cents)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id, status, created_at
+		)
+		INSERT INTO order_status_history (order_id, from_status, to_status, changed_at)
+		SELECT id, NULL, status, created_at FROM inserted`,
 		o.ID, o.UserID, string(o.Status), o.TotalCents)
 	return err
 }
@@ -86,10 +93,19 @@ func (q *Queries) GetOrderItems(ctx context.Context, orderID string) ([]order.It
 // SetOrderStatus is a compare-and-set: it only applies if the order is still in
 // the expected state, which makes every transition safe to attempt twice.
 func (q *Queries) SetOrderStatus(ctx context.Context, id string, from, to order.Status, reason string) (bool, error) {
+	if !from.CanTransitionTo(to) {
+		return false, fmt.Errorf("%w: %s -> %s", order.ErrInvalidTransition, from, to)
+	}
 	tag, err := q.db.Exec(ctx, `
-		UPDATE orders
-		SET status = $3, cancel_reason = NULLIF($4, ''), updated_at = now()
-		WHERE id = $1 AND status = $2`, id, string(from), string(to), reason)
+		WITH changed AS (
+			UPDATE orders
+			SET status = $3, cancel_reason = NULLIF($4, ''), updated_at = now()
+			WHERE id = $1 AND status = $2
+			RETURNING id, status, updated_at
+		)
+		INSERT INTO order_status_history (order_id, from_status, to_status, reason, changed_at)
+		SELECT id, $2, status, NULLIF($4, ''), updated_at FROM changed`,
+		id, string(from), string(to), reason)
 	if err != nil {
 		return false, err
 	}
@@ -111,8 +127,17 @@ func (q *Queries) ListStalledOrders(ctx context.Context, idleBefore time.Time, m
 		SELECT id::text FROM orders
 		WHERE status = 'PENDING_PAYMENT' AND updated_at < $1 AND recovery_attempts < $2
 		  AND NOT EXISTS (
-		      SELECT 1 FROM payments p
+		      SELECT 1 FROM payment_attempts p
 		      WHERE p.order_id = orders.id AND p.status = 'RECONCILING'
+		  )
+		  AND NOT EXISTS (
+		      SELECT 1 FROM payment_attempts p
+		      WHERE p.order_id = orders.id
+		        AND p.attempt_number = (
+		            SELECT MAX(latest.attempt_number)
+		            FROM payment_attempts latest WHERE latest.order_id = orders.id
+		        )
+		        AND p.status = 'FAILED'
 		  )
 		ORDER BY updated_at LIMIT $3`, idleBefore, maxAttempts, limit)
 }

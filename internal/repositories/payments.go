@@ -10,23 +10,24 @@ import (
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 )
 
-// InsertPayment creates the payment row for an order. UNIQUE (order_id) plus
-// ON CONFLICT DO NOTHING makes this safe under duplicate event delivery.
-func (q *Queries) InsertPayment(ctx context.Context, id, orderID string, amountCents int64) error {
+// InsertPaymentAttempt appends an attempt. Callers hold the order lock so the
+// next attempt number is allocated serially for that order.
+func (q *Queries) InsertPaymentAttempt(ctx context.Context, id, orderID string, amountCents int64) error {
 	_, err := q.db.Exec(ctx, `
-		INSERT INTO payments (id, order_id, amount_cents, status)
-		VALUES ($1, $2, $3, 'PROCESSING')
-		ON CONFLICT (order_id) DO NOTHING`, id, orderID, amountCents)
+		INSERT INTO payment_attempts (id, order_id, attempt_number, amount_cents, status)
+		SELECT $1, $2, COALESCE(MAX(attempt_number), 0) + 1, $3, 'PROCESSING'
+		FROM payment_attempts WHERE order_id = $2`, id, orderID, amountCents)
 	return err
 }
 
-func (q *Queries) GetPaymentByOrder(ctx context.Context, orderID string) (*payment.Payment, error) {
+func (q *Queries) GetLatestPaymentAttemptByOrder(ctx context.Context, orderID string) (*payment.Payment, error) {
 	var p payment.Payment
 	var status string
 	err := q.db.QueryRow(ctx, `
-		SELECT id::text, order_id::text, amount_cents, status, COALESCE(failure_reason, '')
-		FROM payments WHERE order_id = $1`, orderID).
-		Scan(&p.ID, &p.OrderID, &p.AmountCents, &status, &p.FailureReason)
+		SELECT id::text, order_id::text, attempt_number, amount_cents, status, COALESCE(failure_reason, '')
+		FROM payment_attempts WHERE order_id = $1
+		ORDER BY attempt_number DESC LIMIT 1`, orderID).
+		Scan(&p.ID, &p.OrderID, &p.AttemptNumber, &p.AmountCents, &status, &p.FailureReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, payment.ErrNotFound
 	}
@@ -41,9 +42,9 @@ func (q *Queries) GetPaymentByID(ctx context.Context, id string) (*payment.Payme
 	var p payment.Payment
 	var status string
 	err := q.db.QueryRow(ctx, `
-		SELECT id::text, order_id::text, amount_cents, status, COALESCE(failure_reason, '')
-		FROM payments WHERE id = $1`, id).
-		Scan(&p.ID, &p.OrderID, &p.AmountCents, &status, &p.FailureReason)
+		SELECT id::text, order_id::text, attempt_number, amount_cents, status, COALESCE(failure_reason, '')
+		FROM payment_attempts WHERE id = $1`, id).
+		Scan(&p.ID, &p.OrderID, &p.AttemptNumber, &p.AmountCents, &status, &p.FailureReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, payment.ErrNotFound
 	}
@@ -56,14 +57,14 @@ func (q *Queries) GetPaymentByID(ctx context.Context, id string) (*payment.Payme
 
 func (q *Queries) SetPaymentResult(ctx context.Context, id string, status payment.Status, reason string) error {
 	_, err := q.db.Exec(ctx, `
-		UPDATE payments SET status = $2, failure_reason = NULLIF($3, ''), updated_at = now()
+		UPDATE payment_attempts SET status = $2, failure_reason = NULLIF($3, ''), updated_at = now()
 		WHERE id = $1`, id, string(status), reason)
 	return err
 }
 
 func (q *Queries) TransitionPaymentStatus(ctx context.Context, id string, from, to payment.Status, reason string) (bool, error) {
 	tag, err := q.db.Exec(ctx, `
-		UPDATE payments SET status = $3, failure_reason = NULLIF($4, ''), updated_at = now()
+		UPDATE payment_attempts SET status = $3, failure_reason = NULLIF($4, ''), updated_at = now()
 		WHERE id = $1 AND status = $2`, id, string(from), string(to), reason)
 	if err != nil {
 		return false, err
@@ -73,21 +74,21 @@ func (q *Queries) TransitionPaymentStatus(ctx context.Context, id string, from, 
 
 func (q *Queries) TouchPendingRefund(ctx context.Context, id string) error {
 	_, err := q.db.Exec(ctx, `
-		UPDATE payments SET updated_at = now()
+		UPDATE payment_attempts SET updated_at = now()
 		WHERE id = $1 AND status = 'REFUND_PENDING'`, id)
 	return err
 }
 
 func (q *Queries) ListStaleRefunds(ctx context.Context, updatedBefore time.Time, limit int) ([]string, error) {
 	return q.listPaymentIDs(ctx, `
-		SELECT id::text FROM payments
+		SELECT id::text FROM payment_attempts
 		WHERE status = 'REFUND_PENDING' AND updated_at < $1
 		ORDER BY updated_at LIMIT $2`, updatedBefore, limit)
 }
 
 func (q *Queries) ScheduleRefundRetry(ctx context.Context, id string, updatedBefore time.Time) (bool, error) {
 	tag, err := q.db.Exec(ctx, `
-		UPDATE payments SET updated_at = now()
+		UPDATE payment_attempts SET updated_at = now()
 		WHERE id = $1 AND status = 'REFUND_PENDING' AND updated_at < $2`,
 		id, updatedBefore)
 	if err != nil {
@@ -99,7 +100,7 @@ func (q *Queries) ScheduleRefundRetry(ctx context.Context, id string, updatedBef
 // FailProcessingPayment closes an in-flight payment when its order is cancelled.
 func (q *Queries) FailProcessingPayment(ctx context.Context, orderID, reason string) error {
 	_, err := q.db.Exec(ctx, `
-		UPDATE payments SET status = 'FAILED', failure_reason = NULLIF($2, ''), updated_at = now()
+		UPDATE payment_attempts SET status = 'FAILED', failure_reason = NULLIF($2, ''), updated_at = now()
 		WHERE order_id = $1 AND status IN ('PROCESSING', 'RECONCILING')`, orderID, reason)
 	return err
 }

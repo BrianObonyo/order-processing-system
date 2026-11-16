@@ -20,20 +20,20 @@ const (
 var (
 	ErrNotFound            = errors.New("order not found")
 	ErrInvalidItems        = errors.New("invalid order items")
+	ErrInvalidTransition   = errors.New("invalid order status transition")
 	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 )
 
-var transitions = map[Status][]Status{
-	StatusPendingPayment: {StatusPaid, StatusCancelled},
+var transitions = map[Status]map[Status]struct{}{
+	StatusPendingPayment: {
+		StatusPaid:      {},
+		StatusCancelled: {},
+	},
 }
 
 func (s Status) CanTransitionTo(to Status) bool {
-	for _, allowed := range transitions[s] {
-		if allowed == to {
-			return true
-		}
-	}
-	return false
+	_, allowed := transitions[s][to]
+	return allowed
 }
 
 func (s Status) IsTerminal() bool { return len(transitions[s]) == 0 }

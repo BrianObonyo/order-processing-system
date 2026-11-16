@@ -30,7 +30,7 @@ var errSkip = errors.New("skip: order is not pending")
 // ProcessOrder charges an order. It is safe to call any number of times for the
 // same order (duplicate Kafka deliveries, recovery re-emits, worker restarts):
 //
-//  1. A payment row is created once per order (UNIQUE order_id).
+//  1. A payment attempt is created once for each explicit retry.
 //  2. The gateway is called outside any DB transaction, keyed by the payment ID,
 //     so a repeated call can never charge twice.
 //  3. The outcome is applied in one transaction that also moves the order and
@@ -49,10 +49,13 @@ func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error
 		if o.Status != order.StatusPendingPayment {
 			return errSkip
 		}
-		if err := q.InsertPayment(ctx, uuid.NewString(), orderID, o.TotalCents); err != nil {
-			return err
+		pay, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		if errors.Is(err, payment.ErrNotFound) {
+			if err := q.InsertPaymentAttempt(ctx, uuid.NewString(), orderID, o.TotalCents); err != nil {
+				return err
+			}
+			pay, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
 		}
-		pay, err = q.GetPaymentByOrder(ctx, orderID)
 		return err
 	})
 	if errors.Is(err, errSkip) {
@@ -70,11 +73,51 @@ func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error
 	case chargeErr == nil:
 		return s.finalizeSuccess(ctx, orderID, pay.ID)
 	case errors.Is(chargeErr, payment.ErrDeclined):
-		return s.finalizeFailure(ctx, orderID, "payment declined")
+		return s.finalizeFailure(ctx, pay.ID, "payment declined")
 	default:
 		metrics.PaymentsProcessed.WithLabelValues("transient_error").Inc()
 		return chargeErr
 	}
+}
+
+// RetryPayment starts a new attempt after a permanent decline. The order stays
+// pending, and the previous attempt remains available for audit.
+func (s *PaymentService) RetryPayment(ctx context.Context, orderID string) (*payment.Payment, error) {
+	var attempt *payment.Payment
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		q := repositories.New(tx)
+		o, err := q.LockOrder(ctx, orderID)
+		if err != nil {
+			return err
+		}
+		if o.Status != order.StatusPendingPayment {
+			return payment.ErrNoRetryableAttempt
+		}
+		previous, err := q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		if errors.Is(err, payment.ErrNotFound) {
+			return payment.ErrNoRetryableAttempt
+		}
+		if err != nil {
+			return err
+		}
+		if previous.Status != payment.StatusFailed {
+			return payment.ErrNoRetryableAttempt
+		}
+		if err := q.InsertPaymentAttempt(ctx, uuid.NewString(), orderID, o.TotalCents); err != nil {
+			return err
+		}
+		attempt, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		if err != nil {
+			return err
+		}
+		return q.InsertOutbox(ctx, orderID, order.EventCreated, order.Event{
+			OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents, OccurredAt: time.Now().UTC(),
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return attempt, nil
 }
 
 func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID string) error {
@@ -195,7 +238,7 @@ func (s *PaymentService) ReconcileExpiredOrder(ctx context.Context, orderID stri
 			return nil
 		}
 
-		pay, err = q.GetPaymentByOrder(ctx, orderID)
+		pay, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
 		if errors.Is(err, payment.ErrNotFound) {
 			cancelled, cancelErr := cancelPendingOrder(ctx, q, orderID, "payment timed out")
 			if cancelled {
@@ -308,9 +351,17 @@ func (s *PaymentService) RequeuePendingRefunds(ctx context.Context, retryAfter t
 	return requeued, nil
 }
 
-func (s *PaymentService) finalizeFailure(ctx context.Context, orderID, reason string) error {
+func (s *PaymentService) finalizeFailure(ctx context.Context, paymentID, reason string) error {
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		_, err := cancelPendingOrder(ctx, repositories.New(tx), orderID, reason)
+		q := repositories.New(tx)
+		pay, err := q.GetPaymentByID(ctx, paymentID)
+		if err != nil {
+			return err
+		}
+		if pay.Status != payment.StatusProcessing && pay.Status != payment.StatusReconciling {
+			return nil
+		}
+		_, err = q.TransitionPaymentStatus(ctx, paymentID, pay.Status, payment.StatusFailed, reason)
 		return err
 	})
 	if err == nil {

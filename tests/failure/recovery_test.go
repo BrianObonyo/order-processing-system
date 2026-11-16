@@ -154,7 +154,7 @@ func TestLatePaymentAfterCancellationIsRefunded(t *testing.T) {
 	}
 	var status string
 	if err := pool.QueryRow(context.Background(),
-		`SELECT status FROM payments WHERE order_id = $1`, res.Order.ID).Scan(&status); err != nil {
+		`SELECT status FROM payment_attempts WHERE order_id = $1`, res.Order.ID).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if payment.Status(status) != payment.StatusRefunded {
@@ -191,7 +191,7 @@ func TestFailedLateRefundStaysPendingAndIsRequeued(t *testing.T) {
 
 	var paymentID, status string
 	if err := pool.QueryRow(context.Background(),
-		`SELECT id::text, status FROM payments WHERE order_id = $1`, res.Order.ID).Scan(&paymentID, &status); err != nil {
+		`SELECT id::text, status FROM payment_attempts WHERE order_id = $1`, res.Order.ID).Scan(&paymentID, &status); err != nil {
 		t.Fatal(err)
 	}
 	if payment.Status(status) != payment.StatusRefundPending {
@@ -201,7 +201,7 @@ func TestFailedLateRefundStaysPendingAndIsRequeued(t *testing.T) {
 		t.Fatalf("payment.refunded events=%d, want 0 before provider confirms refund", n)
 	}
 	if _, err := pool.Exec(context.Background(),
-		`UPDATE payments SET updated_at = now() - interval '10 minutes' WHERE id = $1`, paymentID); err != nil {
+		`UPDATE payment_attempts SET updated_at = now() - interval '10 minutes' WHERE id = $1`, paymentID); err != nil {
 		t.Fatal(err)
 	}
 	sweep, err := recovery.Sweep(context.Background())

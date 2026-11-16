@@ -36,8 +36,10 @@ func TestStatusTransitions(t *testing.T) {
 	if !StatusPendingPayment.CanTransitionTo(StatusPaid) || !StatusPendingPayment.CanTransitionTo(StatusCancelled) {
 		t.Fatal("pending must be able to move to paid or cancelled")
 	}
-	if StatusPaid.CanTransitionTo(StatusCancelled) || StatusCancelled.CanTransitionTo(StatusPaid) {
-		t.Fatal("terminal states must not transition")
+	if StatusPendingPayment.CanTransitionTo(StatusPendingPayment) ||
+		StatusPaid.CanTransitionTo(StatusCancelled) ||
+		StatusCancelled.CanTransitionTo(StatusPaid) {
+		t.Fatal("invalid transitions must be rejected")
 	}
 	if !StatusPaid.IsTerminal() || StatusPendingPayment.IsTerminal() {
 		t.Fatal("IsTerminal mismatch")

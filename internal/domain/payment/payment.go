@@ -26,7 +26,8 @@ const (
 )
 
 var (
-	ErrNotFound = errors.New("payment not found")
+	ErrNotFound           = errors.New("payment not found")
+	ErrNoRetryableAttempt = errors.New("payment has no failed attempt to retry")
 	// ErrDeclined is permanent: retrying will not help.
 	ErrDeclined = errors.New("payment declined")
 	// ErrTransient is temporary: the charge may succeed if retried.
@@ -36,6 +37,7 @@ var (
 type Payment struct {
 	ID            string
 	OrderID       string
+	AttemptNumber int
 	AmountCents   int64
 	Status        Status
 	FailureReason string
