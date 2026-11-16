@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 )
 
 type Config struct {
+	AppEnv      string
 	HTTPAddr    string
 	DatabaseURL string
 	RedisAddr   string
@@ -22,12 +24,21 @@ type Config struct {
 
 	// APIKeys maps API key -> user ID. Dev-grade authentication; swap the
 	// middleware for JWT/OIDC in a real deployment.
-	APIKeys map[string]string
+	APIKeys      map[string]string
+	MetricsToken string
 
 	RunWorkers bool
 
 	PaymentConsumerWorkers int
 	PaymentGatewayAttempts int
+	HTTPRateLimit          float64
+	HTTPRateBurst          int
+	HTTPMaxBodyBytes       int64
+
+	OutboxRetention      time.Duration
+	IdempotencyRetention time.Duration
+	RetentionInterval    time.Duration
+	RetentionBatchSize   int
 
 	OutboxPollInterval time.Duration
 
@@ -42,6 +53,30 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
+	appEnv := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	if appEnv == "" {
+		appEnv = "production"
+	}
+	if appEnv != "development" && appEnv != "production" {
+		return nil, fmt.Errorf("APP_ENV must be development or production")
+	}
+	databaseURL, err := envRequired("DATABASE_URL")
+	if err != nil {
+		return nil, err
+	}
+	redisAddr, err := envOrDevelopmentDefault("REDIS_ADDR", "localhost:6379", appEnv)
+	if err != nil {
+		return nil, err
+	}
+	kafkaBrokers, err := envOrDevelopmentDefault("KAFKA_BROKERS", "localhost:29092", appEnv)
+	if err != nil {
+		return nil, err
+	}
+	apiKeys, err := envRequired("API_KEYS")
+	if err != nil {
+		return nil, err
+	}
+
 	runWorkers, err := envBool("RUN_WORKERS", true)
 	if err != nil {
 		return nil, err
@@ -90,20 +125,57 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	httpRateLimit, err := envFloat("HTTP_RATE_LIMIT", 200)
+	if err != nil {
+		return nil, err
+	}
+	httpRateBurst, err := envInt("HTTP_RATE_BURST", 400)
+	if err != nil {
+		return nil, err
+	}
+	httpMaxBodyBytes, err := envInt("HTTP_MAX_BODY_BYTES", 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	outboxRetention, err := envDuration("OUTBOX_RETENTION", 14*24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	idempotencyRetention, err := envDuration("IDEMPOTENCY_RETENTION", 30*24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	retentionInterval, err := envDuration("RETENTION_INTERVAL", time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	retentionBatchSize, err := envInt("RETENTION_BATCH_SIZE", 5000)
+	if err != nil {
+		return nil, err
+	}
 
 	kafkaTopic := strings.TrimSpace(env("KAFKA_TOPIC", "order-events"))
 	c := &Config{
+		AppEnv:                 appEnv,
 		HTTPAddr:               env("HTTP_ADDR", ":8080"),
-		DatabaseURL:            env("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable"),
-		RedisAddr:              env("REDIS_ADDR", "localhost:6379"),
-		KafkaBrokers:           strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ","),
+		DatabaseURL:            databaseURL,
+		RedisAddr:              redisAddr,
+		KafkaBrokers:           strings.Split(kafkaBrokers, ","),
 		KafkaTopic:             kafkaTopic,
 		KafkaDLQTopic:          strings.TrimSpace(env("KAFKA_DLQ_TOPIC", kafkaTopic+".dead-letter")),
 		KafkaGroupID:           env("KAFKA_GROUP_ID", "order-processing"),
 		KafkaPartitions:        kafkaPartitions,
+		MetricsToken:           strings.TrimSpace(os.Getenv("METRICS_TOKEN")),
 		RunWorkers:             runWorkers,
 		PaymentConsumerWorkers: paymentConsumerWorkers,
 		PaymentGatewayAttempts: paymentGatewayAttempts,
+		HTTPRateLimit:          httpRateLimit,
+		HTTPRateBurst:          httpRateBurst,
+		HTTPMaxBodyBytes:       int64(httpMaxBodyBytes),
+		OutboxRetention:        outboxRetention,
+		IdempotencyRetention:   idempotencyRetention,
+		RetentionInterval:      retentionInterval,
+		RetentionBatchSize:     retentionBatchSize,
 		OutboxPollInterval:     outboxPollInterval,
 		PaymentFailureRate:     paymentFailureRate,
 		PaymentTransientRate:   paymentTransientRate,
@@ -122,7 +194,7 @@ func Load() (*Config, error) {
 		}
 	}
 
-	for _, pair := range strings.Split(env("API_KEYS", "dev-key-1:user-1,dev-key-2:user-2"), ",") {
+	for _, pair := range strings.Split(apiKeys, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
@@ -130,10 +202,10 @@ func Load() (*Config, error) {
 		key, user, ok := strings.Cut(pair, ":")
 		key, user = strings.TrimSpace(key), strings.TrimSpace(user)
 		if !ok || key == "" || user == "" {
-			return nil, fmt.Errorf("API_KEYS entry %q must look like key:user", pair)
+			return nil, fmt.Errorf("API_KEYS entries must look like key:user")
 		}
 		if _, exists := c.APIKeys[key]; exists {
-			return nil, fmt.Errorf("API_KEYS contains duplicate key %q", key)
+			return nil, fmt.Errorf("API_KEYS contains duplicate entries")
 		}
 		c.APIKeys[key] = user
 	}
@@ -192,7 +264,67 @@ func (c *Config) validate() error {
 	if c.KafkaTopic == c.KafkaDLQTopic {
 		return fmt.Errorf("KAFKA_DLQ_TOPIC must differ from KAFKA_TOPIC")
 	}
+	if c.HTTPRateLimit <= 0 || math.IsNaN(c.HTTPRateLimit) || math.IsInf(c.HTTPRateLimit, 0) {
+		return fmt.Errorf("HTTP_RATE_LIMIT must be positive")
+	}
+	if c.HTTPRateBurst < 1 {
+		return fmt.Errorf("HTTP_RATE_BURST must be at least 1")
+	}
+	if c.HTTPMaxBodyBytes < 1 {
+		return fmt.Errorf("HTTP_MAX_BODY_BYTES must be at least 1")
+	}
+	if c.OutboxRetention <= 0 {
+		return fmt.Errorf("OUTBOX_RETENTION must be positive")
+	}
+	if c.IdempotencyRetention <= 0 {
+		return fmt.Errorf("IDEMPOTENCY_RETENTION must be positive")
+	}
+	if c.RetentionInterval <= 0 {
+		return fmt.Errorf("RETENTION_INTERVAL must be positive")
+	}
+	if c.RetentionBatchSize < 1 {
+		return fmt.Errorf("RETENTION_BATCH_SIZE must be at least 1")
+	}
+	if c.AppEnv == "production" {
+		databaseURL, err := url.Parse(c.DatabaseURL)
+		if err != nil || (databaseURL.Scheme != "postgres" && databaseURL.Scheme != "postgresql") || databaseURL.Host == "" {
+			return fmt.Errorf("DATABASE_URL is invalid")
+		}
+		if databaseURL.User != nil {
+			password, hasPassword := databaseURL.User.Password()
+			if databaseURL.User.Username() == "orders" && hasPassword && password == "orders" {
+				return fmt.Errorf("DATABASE_URL must not use the development database credentials in production")
+			}
+		}
+		for key := range c.APIKeys {
+			if len(key) < 32 {
+				return fmt.Errorf("production API_KEYS entries must be at least 32 characters")
+			}
+		}
+		if len(c.MetricsToken) < 32 {
+			return fmt.Errorf("production METRICS_TOKEN must be at least 32 characters")
+		}
+	}
 	return nil
+}
+
+func envRequired(key string) (string, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value != "" {
+		return value, nil
+	}
+	return "", fmt.Errorf("%s is required", key)
+}
+
+func envOrDevelopmentDefault(key, developmentDefault, appEnv string) (string, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value != "" {
+		return value, nil
+	}
+	if appEnv == "development" {
+		return developmentDefault, nil
+	}
+	return "", fmt.Errorf("%s is required when APP_ENV=production", key)
 }
 
 func validRate(rate float64) bool {

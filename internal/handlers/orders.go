@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +25,11 @@ type createOrderRequest struct {
 func (h *OrderHandler) Create(c *gin.Context) {
 	var req createOrderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			respondError(c, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds the allowed size")
+			return
+		}
 		respondError(c, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}

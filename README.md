@@ -31,7 +31,7 @@ curl -s -X POST localhost:8080/api/v1/orders \
 curl -s localhost:8080/api/v1/orders/<id> -H 'X-API-Key: dev-key-1'
 ```
 
-Prometheus: http://localhost:9090, Grafana: http://localhost:3000 (Prometheus datasource preconfigured), metrics: `/metrics`.
+Prometheus: http://localhost:9090, Grafana: http://localhost:3000 (Prometheus datasource preconfigured), metrics: `/metrics`. The development stack leaves metrics unauthenticated unless `METRICS_TOKEN` is set. Compose publishes service ports only on localhost; Grafana uses its standard first-login password change.
 
 To run the API on your host instead, start the dependencies with `docker compose up -d postgres redis kafka`, apply migrations with `docker compose run --rm migrate`, then stop the containerized API. In PowerShell, load the example environment and start the host process:
 
@@ -67,6 +67,14 @@ POST /orders ──► PENDING_PAYMENT ──► PAID
 Every Kafka message uses an envelope containing an event ID, type, schema version, correlation ID, occurrence time, and event data. The event ID is stored with its outbox row, so duplicate publishes retain the same ID. Malformed supported events are sent to the configured dead-letter topic before their source offset is acknowledged.
 
 Payment and refund processing is attempted once per delivery; transient failures are retried by the database-backed recovery worker instead of sleeping and retrying inside a Kafka partition. `PAYMENT_CONSUMER_WORKERS` controls the number of group members (default 3); effective concurrency is limited by `KAFKA_PARTITIONS` (default 3). Existing Kafka topics are not resized automatically; coordinate partition increases with Kafka administration because changing a keyed topic's partition count can change key-to-partition assignments. `PAYMENT_GATEWAY_MAX_ATTEMPTS` defaults to 1 to avoid multiplying gateway retries by recovery retries.
+
+## Operations and security
+
+- `APP_ENV` defaults to `production`. Startup always requires explicit `DATABASE_URL` and `API_KEYS`; there are no source-code defaults for database credentials or API keys. Production additionally requires explicit `REDIS_ADDR`, `KAFKA_BROKERS`, and `METRICS_TOKEN`, rejects the sample database credentials, and requires API keys and the metrics token to each be at least 32 characters. The checked-in `.env.example` and Compose settings are for local development only.
+- The HTTP server has read, write, idle, and header timeouts. Order request bodies are limited by `HTTP_MAX_BODY_BYTES` (default 1 MiB); a process-wide token bucket enforces `HTTP_RATE_LIMIT` and `HTTP_RATE_BURST`. `/healthz` and `/readyz` bypass rate limiting for probes. Readiness responses expose only `ok` or `unavailable`; detailed failures are logged with a request ID.
+- When `METRICS_TOKEN` is configured, `/metrics` requires `Authorization: Bearer <token>`. Configure production Prometheus with the same token using a protected credentials file.
+- Retention removes up to `RETENTION_BATCH_SIZE` rows from each table per run. Published outbox rows older than `OUTBOX_RETENTION` (default 14 days) are eligible; unpublished rows are never deleted. Idempotency keys older than `IDEMPOTENCY_RETENTION` (default 30 days) are removed, so a client may reuse a key after that period. `RETENTION_INTERVAL` controls cleanup cadence.
+- CI runs formatting, vet, golangci-lint, govulncheck, unit tests including `-race`, PostgreSQL integration tests, and a Docker image build.
 
 ### Payment reconciliation and refunds
 
@@ -125,5 +133,5 @@ The integration suite proves the hard guarantees: 100 concurrent buyers on 10 un
 
 - Delivery is at-least-once everywhere; idempotency makes it effectively-once.
 - Rejected requests (for example out of stock) roll back completely, including the idempotency key, so a client retry re-evaluates against current stock.
-- Authentication is a static API-key map for development. Replace `middleware.APIKeyAuth` with JWT/OIDC for real use.
+- Authentication is a static API-key map. Replace `middleware.APIKeyAuth` with JWT/OIDC for real use.
 - `pgx` is used directly. sqlc can replace the hand-written `internal/repositories` later without touching services.

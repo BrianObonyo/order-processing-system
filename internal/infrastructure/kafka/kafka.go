@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -30,12 +31,14 @@ func EnsureTopic(ctx context.Context, brokers []string, topic string, partitions
 	return fmt.Errorf("ensure topic %q: %w", topic, lastErr)
 }
 
-func createTopic(ctx context.Context, broker, topic string, partitions int) error {
+func createTopic(ctx context.Context, broker, topic string, partitions int) (err error) {
 	conn, err := (&kafkago.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", broker)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() {
+		err = errors.Join(err, conn.Close())
+	}()
 
 	controller, err := conn.Controller()
 	if err != nil {
@@ -46,7 +49,9 @@ func createTopic(ctx context.Context, broker, topic string, partitions int) erro
 	if err != nil {
 		return err
 	}
-	defer cc.Close()
+	defer func() {
+		err = errors.Join(err, cc.Close())
+	}()
 	return cc.CreateTopics(kafkago.TopicConfig{Topic: topic, NumPartitions: partitions, ReplicationFactor: 1})
 }
 

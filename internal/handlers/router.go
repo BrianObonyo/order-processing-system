@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -13,10 +14,14 @@ import (
 )
 
 type Deps struct {
-	Orders   *services.OrderService
-	Products *services.ProductService
-	APIKeys  map[string]string
-	Locker   middleware.Locker // may be nil
+	Orders              *services.OrderService
+	Products            *services.ProductService
+	APIKeys             map[string]string
+	MetricsToken        string
+	Locker              middleware.Locker // may be nil
+	MaxRequestBodyBytes int64
+	HTTPRateLimit       float64
+	HTTPRateBurst       int
 	// Readiness checks run by /readyz, keyed by dependency name.
 	Readiness map[string]func(context.Context) error
 }
@@ -24,7 +29,16 @@ type Deps struct {
 func NewRouter(d Deps) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery(), gin.Logger(), middleware.Metrics())
+	r.Use(
+		middleware.RequestID(),
+		middleware.AccessLog(),
+		gin.CustomRecovery(func(c *gin.Context, recovered any) {
+			slog.Error("http panic recovered", "request_id", middleware.RequestIDValue(c), "err", recovered)
+			respondError(c, http.StatusInternalServerError, "internal_error", "something went wrong")
+		}),
+		middleware.RateLimit(defaultRateLimit(d.HTTPRateLimit, d.HTTPRateBurst)),
+		middleware.Metrics(),
+	)
 
 	r.GET("/healthz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
 	r.GET("/readyz", func(c *gin.Context) {
@@ -33,21 +47,39 @@ func NewRouter(d Deps) *gin.Engine {
 		status, code := gin.H{}, http.StatusOK
 		for name, check := range d.Readiness {
 			if err := check(ctx); err != nil {
-				status[name], code = err.Error(), http.StatusServiceUnavailable
+				slog.Error("readiness check failed",
+					"request_id", middleware.RequestIDValue(c), "dependency", name, "err", err)
+				status[name], code = "unavailable", http.StatusServiceUnavailable
 			} else {
 				status[name] = "ok"
 			}
 		}
 		c.JSON(code, status)
 	})
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	metricsHandler := gin.WrapH(promhttp.Handler())
+	if d.MetricsToken != "" {
+		r.GET("/metrics", middleware.MetricsTokenAuth(d.MetricsToken), metricsHandler)
+	} else {
+		r.GET("/metrics", metricsHandler)
+	}
 
 	orders := &OrderHandler{svc: d.Orders}
 	products := &ProductHandler{svc: d.Products}
 
 	v1 := r.Group("/api/v1", middleware.APIKeyAuth(d.APIKeys))
 	v1.GET("/products", products.List)
-	v1.POST("/orders", middleware.Idempotency(d.Locker), orders.Create)
+	maxBodyBytes := d.MaxRequestBodyBytes
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = 1 << 20
+	}
+	v1.POST("/orders", middleware.MaxRequestBodyBytes(maxBodyBytes), middleware.Idempotency(d.Locker), orders.Create)
 	v1.GET("/orders/:id", orders.Get)
 	return r
+}
+
+func defaultRateLimit(rate float64, burst int) (float64, int) {
+	if rate <= 0 || burst <= 0 {
+		return 200, 400
+	}
+	return rate, burst
 }

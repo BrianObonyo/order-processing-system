@@ -45,7 +45,11 @@ func run() error {
 	defer pool.Close()
 
 	rds := redisinfra.New(cfg.RedisAddr)
-	defer rds.Close()
+	defer func() {
+		if err := rds.Close(); err != nil {
+			slog.Error("redis close failed", "err", err)
+		}
+	}()
 
 	if err := kafkainfra.EnsureTopic(ctx, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaPartitions); err != nil {
 		return err
@@ -54,9 +58,17 @@ func run() error {
 		return err
 	}
 	producer := kafkainfra.NewProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
-	defer producer.Close()
+	defer func() {
+		if err := producer.Close(); err != nil {
+			slog.Error("Kafka producer close failed", "err", err)
+		}
+	}()
 	dlqProducer := kafkainfra.NewProducer(cfg.KafkaBrokers, cfg.KafkaDLQTopic)
-	defer dlqProducer.Close()
+	defer func() {
+		if err := dlqProducer.Close(); err != nil {
+			slog.Error("Kafka DLQ producer close failed", "err", err)
+		}
+	}()
 
 	// Modules.
 	orderSvc := services.NewOrderService(pool)
@@ -82,19 +94,32 @@ func run() error {
 			})
 		}
 		start(workers.NewRecoveryWorker(recoverySvc, rds, cfg.RecoveryInterval).Run)
+		start(workers.NewRetentionWorker(pool, cfg.RetentionInterval, cfg.OutboxRetention, cfg.IdempotencyRetention, cfg.RetentionBatchSize).Run)
 	}
 
 	router := handlers.NewRouter(handlers.Deps{
-		Orders:   orderSvc,
-		Products: productSvc,
-		APIKeys:  cfg.APIKeys,
-		Locker:   rds,
+		Orders:              orderSvc,
+		Products:            productSvc,
+		APIKeys:             cfg.APIKeys,
+		MetricsToken:        cfg.MetricsToken,
+		Locker:              rds,
+		MaxRequestBodyBytes: cfg.HTTPMaxBodyBytes,
+		HTTPRateLimit:       cfg.HTTPRateLimit,
+		HTTPRateBurst:       cfg.HTTPRateBurst,
 		Readiness: map[string]func(context.Context) error{
 			"postgres": pool.Ping,
 			"redis":    rds.Ping,
 		},
 	})
-	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: router, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 
 	errCh := make(chan error, 1)
 	go func() {
