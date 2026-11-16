@@ -62,6 +62,16 @@ POST /orders ──► PENDING_PAYMENT ──► PAID
 4. **Success**: stock reservation becomes a real deduction, order becomes `PAID`. **Decline**: reservation released, order `CANCELLED`.
 5. **Recovery worker** re-emits events for stalled orders, checks the gateway before cancelling an order with an uncertain charge, and retries pending refunds. A late successful charge is refunded by the gateway before it is marked `REFUNDED`.
 
+### Payment reconciliation and refunds
+
+An expired order with a `PROCESSING` payment is not cancelled based only on a timeout. Recovery changes the payment to `RECONCILING` and asks the gateway for the charge outcome:
+
+- A confirmed successful charge completes the order and commits its reserved stock.
+- A confirmed decline or charge absence allows the order to be cancelled and its stock released.
+- A pending result or gateway lookup error leaves the order and reservation pending for another reconciliation attempt.
+
+If a charge succeeds after its order was cancelled, the payment moves to `REFUND_PENDING` and a `payment.refund_requested` event is written to the outbox. The payment consumer calls the gateway's idempotent refund operation using the payment ID. Only after the gateway confirms the refund does the system mark the payment `REFUNDED` and emit `payment.refunded`. Recovery republishes refund requests that remain pending, so a failed or interrupted refund can be retried safely. Migration `000002_payment_reconciliation` adds the `RECONCILING` and `REFUND_PENDING` payment states.
+
 ## How each objective is met
 
 | Objective | Mechanism |
@@ -97,7 +107,7 @@ make test-integration   # needs Docker; real PostgreSQL via Testcontainers
 make loadtest           # k6: 100 orders/s plus 50 buyers fighting over 10 units
 ```
 
-The integration suite proves the hard guarantees: 100 concurrent buyers on 10 units produce exactly 10 orders, 20 parallel requests with one key produce one order, duplicate event delivery produces one payment, a failed order rolls back stock and key together, and a stale order is cancelled with stock released.
+The integration suite proves the hard guarantees: 100 concurrent buyers on 10 units produce exactly 10 orders, 20 parallel requests with one key produce one order, duplicate event delivery produces one payment, a failed order rolls back stock and key together, stale orders are reconciled before cancellation, and late payments are refunded only after provider confirmation.
 
 ## Notes
 
