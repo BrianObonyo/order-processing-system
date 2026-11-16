@@ -1,12 +1,15 @@
 DO $$
 BEGIN
     IF EXISTS (
-        SELECT 1 FROM payment_attempts
-        GROUP BY order_id HAVING count(*) > 1
+        SELECT 1
+        FROM payment_attempts
+        GROUP BY order_id
+        HAVING COUNT(*) > 1
     ) THEN
         RAISE EXCEPTION 'cannot roll back payment attempts while an order has multiple attempts';
     END IF;
-END $$;
+END;
+$$;
 
 DROP INDEX payment_attempts_order_created_idx;
 ALTER TABLE payment_attempts DROP CONSTRAINT payment_attempts_order_attempt_key;

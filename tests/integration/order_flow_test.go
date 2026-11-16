@@ -4,12 +4,17 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/event"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/messaging"
@@ -259,5 +264,57 @@ func TestOutboxRelayPublishesEachEventOnce(t *testing.T) {
 	}
 	if len(pub.msgs) != 1 || pub.msgs[0].Type != order.EventCreated || pub.msgs[0].Key != res.Order.ID {
 		t.Fatalf("published %+v, want exactly one order.created for %s", pub.msgs, res.Order.ID)
+	}
+	var envelope event.Envelope
+	if err := json.Unmarshal(pub.msgs[0].Payload, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if err := envelope.Validate(order.EventCreated); err != nil {
+		t.Fatalf("published envelope invalid: %v", err)
+	}
+	if envelope.CorrelationID != res.Order.ID {
+		t.Fatalf("correlation_id=%q, want %q", envelope.CorrelationID, res.Order.ID)
+	}
+	var data order.Event
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.OrderID != res.Order.ID {
+		t.Fatalf("event data order_id=%q, want %q", data.OrderID, res.Order.ID)
+	}
+	var outboxEventID string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT event_id::text FROM outbox WHERE aggregate_id = $1 AND event_type = $2`,
+		res.Order.ID, order.EventCreated).Scan(&outboxEventID); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.ID != outboxEventID {
+		t.Fatalf("event_id=%q, want stable outbox ID %q", envelope.ID, outboxEventID)
+	}
+}
+
+func TestOutboxEventIDMigrationCanRollback(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	_, currentFile, _, _ := runtime.Caller(0)
+	downPath := filepath.Join(filepath.Dir(currentFile), "..", "..", "migrations", "000005_event_envelopes.down.sql")
+	sql, err := os.ReadFile(downPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), string(sql)); err != nil {
+		t.Fatalf("run event envelope down migration: %v", err)
+	}
+
+	var exists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'outbox' AND column_name = 'event_id'
+		)`,
+	).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("event_id column still exists after rollback")
 	}
 }

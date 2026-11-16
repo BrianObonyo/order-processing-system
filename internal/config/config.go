@@ -14,15 +14,20 @@ type Config struct {
 	DatabaseURL string
 	RedisAddr   string
 
-	KafkaBrokers []string
-	KafkaTopic   string
-	KafkaGroupID string
+	KafkaBrokers    []string
+	KafkaTopic      string
+	KafkaDLQTopic   string
+	KafkaGroupID    string
+	KafkaPartitions int
 
 	// APIKeys maps API key -> user ID. Dev-grade authentication; swap the
 	// middleware for JWT/OIDC in a real deployment.
 	APIKeys map[string]string
 
 	RunWorkers bool
+
+	PaymentConsumerWorkers int
+	PaymentGatewayAttempts int
 
 	OutboxPollInterval time.Duration
 
@@ -73,24 +78,41 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	paymentConsumerWorkers, err := envInt("PAYMENT_CONSUMER_WORKERS", 3)
+	if err != nil {
+		return nil, err
+	}
+	paymentGatewayAttempts, err := envInt("PAYMENT_GATEWAY_MAX_ATTEMPTS", 1)
+	if err != nil {
+		return nil, err
+	}
+	kafkaPartitions, err := envInt("KAFKA_PARTITIONS", 3)
+	if err != nil {
+		return nil, err
+	}
 
+	kafkaTopic := strings.TrimSpace(env("KAFKA_TOPIC", "order-events"))
 	c := &Config{
-		HTTPAddr:             env("HTTP_ADDR", ":8080"),
-		DatabaseURL:          env("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable"),
-		RedisAddr:            env("REDIS_ADDR", "localhost:6379"),
-		KafkaBrokers:         strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ","),
-		KafkaTopic:           env("KAFKA_TOPIC", "order-events"),
-		KafkaGroupID:         env("KAFKA_GROUP_ID", "order-processing"),
-		RunWorkers:           runWorkers,
-		OutboxPollInterval:   outboxPollInterval,
-		PaymentFailureRate:   paymentFailureRate,
-		PaymentTransientRate: paymentTransientRate,
-		PaymentLatency:       paymentLatency,
-		RecoveryInterval:     recoveryInterval,
-		OrderPaymentTimeout:  orderPaymentTimeout,
-		PaymentRetryAfter:    paymentRetryAfter,
-		PaymentMaxRecovery:   paymentMaxRecovery,
-		APIKeys:              map[string]string{},
+		HTTPAddr:               env("HTTP_ADDR", ":8080"),
+		DatabaseURL:            env("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable"),
+		RedisAddr:              env("REDIS_ADDR", "localhost:6379"),
+		KafkaBrokers:           strings.Split(env("KAFKA_BROKERS", "localhost:29092"), ","),
+		KafkaTopic:             kafkaTopic,
+		KafkaDLQTopic:          strings.TrimSpace(env("KAFKA_DLQ_TOPIC", kafkaTopic+".dead-letter")),
+		KafkaGroupID:           env("KAFKA_GROUP_ID", "order-processing"),
+		KafkaPartitions:        kafkaPartitions,
+		RunWorkers:             runWorkers,
+		PaymentConsumerWorkers: paymentConsumerWorkers,
+		PaymentGatewayAttempts: paymentGatewayAttempts,
+		OutboxPollInterval:     outboxPollInterval,
+		PaymentFailureRate:     paymentFailureRate,
+		PaymentTransientRate:   paymentTransientRate,
+		PaymentLatency:         paymentLatency,
+		RecoveryInterval:       recoveryInterval,
+		OrderPaymentTimeout:    orderPaymentTimeout,
+		PaymentRetryAfter:      paymentRetryAfter,
+		PaymentMaxRecovery:     paymentMaxRecovery,
+		APIKeys:                map[string]string{},
 	}
 
 	for i, broker := range c.KafkaBrokers {
@@ -151,6 +173,24 @@ func (c *Config) validate() error {
 	}
 	if c.PaymentMaxRecovery < 1 {
 		return fmt.Errorf("PAYMENT_MAX_RECOVERY must be at least 1")
+	}
+	if c.PaymentConsumerWorkers < 1 {
+		return fmt.Errorf("PAYMENT_CONSUMER_WORKERS must be at least 1")
+	}
+	if c.PaymentGatewayAttempts < 1 {
+		return fmt.Errorf("PAYMENT_GATEWAY_MAX_ATTEMPTS must be at least 1")
+	}
+	if c.KafkaPartitions < 1 {
+		return fmt.Errorf("KAFKA_PARTITIONS must be at least 1")
+	}
+	if strings.TrimSpace(c.KafkaTopic) == "" {
+		return fmt.Errorf("KAFKA_TOPIC must not be empty")
+	}
+	if strings.TrimSpace(c.KafkaDLQTopic) == "" {
+		return fmt.Errorf("KAFKA_DLQ_TOPIC must not be empty")
+	}
+	if c.KafkaTopic == c.KafkaDLQTopic {
+		return fmt.Errorf("KAFKA_DLQ_TOPIC must differ from KAFKA_TOPIC")
 	}
 	return nil
 }

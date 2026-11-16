@@ -2,7 +2,6 @@ package kafka
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -96,7 +95,7 @@ func NewConsumer(brokers []string, topic, groupID string) *Consumer {
 func (c *Consumer) Fetch(ctx context.Context) (messaging.Delivery, error) {
 	m, err := c.r.FetchMessage(ctx)
 	if err != nil {
-		return messaging.Delivery{}, err
+		return nil, err
 	}
 	var typ string
 	for _, h := range m.Headers {
@@ -104,18 +103,25 @@ func (c *Consumer) Fetch(ctx context.Context) (messaging.Delivery, error) {
 			typ = string(h.Value)
 		}
 	}
-	return messaging.Delivery{
-		Message: messaging.Message{Key: string(m.Key), Type: typ, Payload: m.Value},
-		Raw:     m,
+	return &delivery{
+		reader: c.r,
+		offset: m,
+		message: messaging.Message{
+			Key: string(m.Key), Type: typ, Payload: m.Value,
+		},
 	}, nil
 }
 
-func (c *Consumer) Commit(ctx context.Context, d messaging.Delivery) error {
-	m, ok := d.Raw.(kafkago.Message)
-	if !ok {
-		return errors.New("kafka commit: unexpected delivery handle")
-	}
-	return c.r.CommitMessages(ctx, m)
+type delivery struct {
+	reader  *kafkago.Reader
+	offset  kafkago.Message
+	message messaging.Message
+}
+
+func (d *delivery) Message() messaging.Message { return d.message }
+
+func (d *delivery) Ack(ctx context.Context) error {
+	return d.reader.CommitMessages(ctx, d.offset)
 }
 
 func (c *Consumer) Close() error { return c.r.Close() }

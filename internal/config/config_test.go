@@ -16,6 +16,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.PaymentMaxRecovery != 3 || len(cfg.KafkaBrokers) != 1 || cfg.KafkaBrokers[0] != "localhost:29092" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
+	if cfg.PaymentConsumerWorkers != 3 || cfg.PaymentGatewayAttempts != 1 ||
+		cfg.KafkaPartitions != 3 || cfg.KafkaDLQTopic != "order-events.dead-letter" {
+		t.Fatalf("unexpected event-processing defaults: %+v", cfg)
+	}
 }
 
 func TestLoadRejectsMalformedConfiguration(t *testing.T) {
@@ -30,6 +34,9 @@ func TestLoadRejectsMalformedConfiguration(t *testing.T) {
 		{name: "invalid rate", key: "PAYMENT_FAILURE_RATE", value: "1.5"},
 		{name: "negative interval", key: "OUTBOX_POLL_INTERVAL", value: "-1s"},
 		{name: "empty broker", key: "KAFKA_BROKERS", value: "localhost:9092, "},
+		{name: "zero consumer workers", key: "PAYMENT_CONSUMER_WORKERS", value: "0"},
+		{name: "zero gateway attempts", key: "PAYMENT_GATEWAY_MAX_ATTEMPTS", value: "0"},
+		{name: "zero Kafka partitions", key: "KAFKA_PARTITIONS", value: "0"},
 	}
 
 	for _, tt := range tests {
@@ -69,7 +76,12 @@ func setDefaultConfigEnv(t *testing.T) {
 		"ORDER_PAYMENT_TIMEOUT",
 		"PAYMENT_RETRY_AFTER",
 		"PAYMENT_MAX_RECOVERY",
+		"PAYMENT_CONSUMER_WORKERS",
+		"PAYMENT_GATEWAY_MAX_ATTEMPTS",
+		"KAFKA_PARTITIONS",
 		"KAFKA_BROKERS",
+		"KAFKA_TOPIC",
+		"KAFKA_DLQ_TOPIC",
 	} {
 		t.Setenv(key, "")
 	}

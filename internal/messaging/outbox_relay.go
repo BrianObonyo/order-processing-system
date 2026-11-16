@@ -2,12 +2,14 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/event"
 	"github.com/BrianObonyo/order-processing-system/internal/metrics"
 	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 )
@@ -64,7 +66,19 @@ func (r *OutboxRelay) Flush(ctx context.Context) (int, error) {
 		msgs := make([]Message, len(events))
 		ids := make([]int64, len(events))
 		for i, e := range events {
-			msgs[i] = Message{Key: e.AggregateID, Type: e.EventType, Payload: e.Payload}
+			envelope := event.Envelope{
+				ID:            e.EventID,
+				Type:          e.EventType,
+				SchemaVersion: event.CurrentSchemaVersion,
+				CorrelationID: e.AggregateID,
+				OccurredAt:    e.CreatedAt.UTC(),
+				Data:          e.Payload,
+			}
+			payload, err := json.Marshal(envelope)
+			if err != nil {
+				return err
+			}
+			msgs[i] = Message{Key: e.AggregateID, Type: e.EventType, Payload: payload}
 			ids[i] = e.ID
 		}
 

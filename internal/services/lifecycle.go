@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"time"
 
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/repositories"
@@ -41,7 +40,7 @@ func cancelPendingOrder(ctx context.Context, q *repositories.Queries, orderID, r
 		return false, err
 	}
 	err = q.InsertOutbox(ctx, orderID, order.EventCancelled, order.Event{
-		OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents, Reason: reason, OccurredAt: time.Now().UTC(),
+		OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents, Reason: reason,
 	})
 	return err == nil, err
 }
@@ -70,7 +69,7 @@ func markOrderPaid(ctx context.Context, q *repositories.Queries, orderID string)
 		return false, err
 	}
 	err = q.InsertOutbox(ctx, orderID, order.EventPaid, order.Event{
-		OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents, OccurredAt: time.Now().UTC(),
+		OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents,
 	})
 	return err == nil, err
 }

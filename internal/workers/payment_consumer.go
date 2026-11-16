@@ -5,85 +5,139 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/BrianObonyo/order-processing-system/internal/domain/event"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/messaging"
-	"github.com/BrianObonyo/order-processing-system/internal/services"
 )
 
-// PaymentConsumer reads order and payment events and applies them idempotently.
+const deadLetterEventType = "message.dead_letter"
+
+type PaymentProcessor interface {
+	ProcessOrder(ctx context.Context, orderID string) error
+	ProcessRefund(ctx context.Context, paymentID string) error
+}
+
 type PaymentConsumer struct {
-	consumer    messaging.Consumer
-	payments    *services.PaymentService
-	maxAttempts int
+	consumer messaging.Consumer
+	payments PaymentProcessor
+	dlq      messaging.Publisher
 }
 
-func NewPaymentConsumer(c messaging.Consumer, p *services.PaymentService) *PaymentConsumer {
-	return &PaymentConsumer{consumer: c, payments: p, maxAttempts: 3}
+func NewPaymentConsumer(c messaging.Consumer, p PaymentProcessor, dlq messaging.Publisher) *PaymentConsumer {
+	return &PaymentConsumer{consumer: c, payments: p, dlq: dlq}
 }
 
-func (w *PaymentConsumer) Run(ctx context.Context) {
+func (w *PaymentConsumer) Run(ctx context.Context) error {
 	for {
 		d, err := w.consumer.Fetch(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
 			slog.Error("payment consumer: fetch failed", "err", err)
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			case <-time.After(time.Second):
 			}
 			continue
 		}
 
-		w.handle(ctx, d.Message)
+		message := d.Message()
+		if err := w.handle(ctx, message); err != nil {
+			if publishErr := w.publishDeadLetter(ctx, message, err); publishErr != nil {
+				return fmt.Errorf("payment consumer: publish dead letter: %w", publishErr)
+			}
+			slog.Warn("payment consumer: malformed event sent to dead-letter topic", "event_type", message.Type, "err", err)
+		}
 
-		// Commit after handling. If we crash before this line the event is
-		// delivered again, and ProcessOrder is idempotent.
-		if err := w.consumer.Commit(ctx, d); err != nil && ctx.Err() == nil {
-			slog.Error("payment consumer: commit failed", "err", err)
+		if err := d.Ack(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("payment consumer: acknowledge message: %w", err)
 		}
 	}
 }
 
-func (w *PaymentConsumer) handle(ctx context.Context, m messaging.Message) {
+func (w *PaymentConsumer) handle(ctx context.Context, m messaging.Message) error {
 	if m.Type != order.EventCreated && m.Type != order.EventPaymentRefundRequested {
-		return // other event types are for other consumers
-	}
-	var ev order.Event
-	if err := json.Unmarshal(m.Payload, &ev); err != nil {
-		slog.Error("payment consumer: dropping malformed event", "err", err)
-		return
-	}
-	if m.Type == order.EventPaymentRefundRequested && ev.PaymentID == "" {
-		slog.Error("payment consumer: dropping refund event without payment_id", "order_id", ev.OrderID)
-		return
+		if m.Type == "" {
+			return fmt.Errorf("message has no event_type")
+		}
+		return nil
 	}
 
-	backoff := 200 * time.Millisecond
-	for attempt := 1; attempt <= w.maxAttempts; attempt++ {
-		var err error
-		if m.Type == order.EventPaymentRefundRequested {
-			err = w.payments.ProcessRefund(ctx, ev.PaymentID)
-		} else {
-			err = w.payments.ProcessOrder(ctx, ev.OrderID)
-		}
-		if err == nil || errors.Is(err, order.ErrNotFound) || errors.Is(err, payment.ErrNotFound) {
-			return
-		}
-		slog.Warn("payment consumer: processing failed", "order_id", ev.OrderID, "payment_id", ev.PaymentID, "attempt", attempt, "err", err)
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-		backoff *= 2
+	var envelope event.Envelope
+	if err := json.Unmarshal(m.Payload, &envelope); err != nil {
+		return fmt.Errorf("decode event envelope: %w", err)
 	}
-	// Give up for now. The recovery worker re-emits the event or times the order out.
-	slog.Error("payment consumer: giving up, recovery will retry", "order_id", ev.OrderID, "payment_id", ev.PaymentID)
+	if err := envelope.Validate(m.Type); err != nil {
+		return err
+	}
+
+	var ev order.Event
+	if err := json.Unmarshal(envelope.Data, &ev); err != nil {
+		return fmt.Errorf("decode event data: %w", err)
+	}
+	if ev.OrderID == "" || ev.OrderID != m.Key || ev.OrderID != envelope.CorrelationID {
+		return fmt.Errorf("event order_id must match its key and correlation_id")
+	}
+	if m.Type == order.EventPaymentRefundRequested && ev.PaymentID == "" {
+		return fmt.Errorf("refund event is missing payment_id")
+	}
+
+	var err error
+	if m.Type == order.EventPaymentRefundRequested {
+		err = w.payments.ProcessRefund(ctx, ev.PaymentID)
+	} else {
+		err = w.payments.ProcessOrder(ctx, ev.OrderID)
+	}
+	if err != nil && !errors.Is(err, order.ErrNotFound) && !errors.Is(err, payment.ErrNotFound) {
+		// Payment and refund recovery re-emits durable work with a bounded delay.
+		// Acknowledge this delivery instead of blocking its Kafka partition.
+		slog.Warn("payment consumer: processing failed; durable recovery will retry",
+			"order_id", ev.OrderID, "payment_id", ev.PaymentID, "err", err)
+	}
+	return nil
+}
+
+type deadLetterData struct {
+	OriginalType    string `json:"original_event_type"`
+	OriginalKey     string `json:"original_key"`
+	OriginalPayload []byte `json:"original_payload"`
+	FailureReason   string `json:"failure_reason"`
+}
+
+func (w *PaymentConsumer) publishDeadLetter(ctx context.Context, original messaging.Message, cause error) error {
+	data, err := json.Marshal(deadLetterData{
+		OriginalType: original.Type, OriginalKey: original.Key,
+		OriginalPayload: original.Payload, FailureReason: cause.Error(),
+	})
+	if err != nil {
+		return err
+	}
+	id := uuid.NewString()
+	correlationID := original.Key
+	if correlationID == "" {
+		correlationID = id
+	}
+	envelope := event.Envelope{
+		ID: id, Type: deadLetterEventType, SchemaVersion: event.CurrentSchemaVersion,
+		CorrelationID: correlationID, OccurredAt: time.Now().UTC(), Data: data,
+	}
+	payload, err := json.Marshal(envelope)
+	if err != nil {
+		return err
+	}
+	return w.dlq.Publish(ctx, []messaging.Message{{
+		Key: original.Key, Type: deadLetterEventType, Payload: payload,
+	}})
 }

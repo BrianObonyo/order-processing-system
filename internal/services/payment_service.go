@@ -111,7 +111,7 @@ func (s *PaymentService) RetryPayment(ctx context.Context, orderID string) (*pay
 			return err
 		}
 		return q.InsertOutbox(ctx, orderID, order.EventCreated, order.Event{
-			OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents, OccurredAt: time.Now().UTC(),
+			OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents,
 		})
 	})
 	if err != nil {
@@ -167,7 +167,7 @@ func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID
 		}
 		return q.InsertOutbox(ctx, orderID, order.EventPaymentRefundRequested, order.Event{
 			OrderID: orderID, PaymentID: paymentID, TotalCents: pay.AmountCents,
-			Reason: "order no longer pending", OccurredAt: time.Now().UTC(),
+			Reason: "order no longer pending",
 		})
 	})
 	if err != nil {
@@ -209,7 +209,7 @@ func (s *PaymentService) ProcessRefund(ctx context.Context, paymentID string) er
 		}
 		return q.InsertOutbox(ctx, pay.OrderID, order.EventPaymentRefunded, order.Event{
 			OrderID: pay.OrderID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
-			Reason: "order no longer pending", OccurredAt: time.Now().UTC(),
+			Reason: "order no longer pending",
 		})
 	})
 	if err != nil {
@@ -334,7 +334,7 @@ func (s *PaymentService) RequeuePendingRefunds(ctx context.Context, retryAfter t
 			}
 			if err := tq.InsertOutbox(ctx, pay.OrderID, order.EventPaymentRefundRequested, order.Event{
 				OrderID: pay.OrderID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
-				Reason: pay.FailureReason, OccurredAt: time.Now().UTC(),
+				Reason: pay.FailureReason,
 			}); err != nil {
 				return err
 			}

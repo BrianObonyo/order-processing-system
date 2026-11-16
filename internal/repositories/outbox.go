@@ -3,13 +3,16 @@ package repositories
 import (
 	"context"
 	"encoding/json"
+	"time"
 )
 
 type OutboxEvent struct {
 	ID          int64
+	EventID     string
 	AggregateID string
 	EventType   string
 	Payload     []byte
+	CreatedAt   time.Time
 }
 
 func (q *Queries) InsertOutbox(ctx context.Context, aggregateID, eventType string, payload any) error {
@@ -27,7 +30,7 @@ func (q *Queries) InsertOutbox(ctx context.Context, aggregateID, eventType strin
 // relay instances run without blocking or double-claiming the same rows.
 func (q *Queries) FetchUnpublished(ctx context.Context, limit int) ([]OutboxEvent, error) {
 	rows, err := q.db.Query(ctx, `
-		SELECT id, aggregate_id::text, event_type, payload
+		SELECT id, event_id::text, aggregate_id::text, event_type, payload, created_at
 		FROM outbox WHERE published_at IS NULL
 		ORDER BY id LIMIT $1
 		FOR UPDATE SKIP LOCKED`, limit)
@@ -39,7 +42,7 @@ func (q *Queries) FetchUnpublished(ctx context.Context, limit int) ([]OutboxEven
 	var out []OutboxEvent
 	for rows.Next() {
 		var e OutboxEvent
-		if err := rows.Scan(&e.ID, &e.AggregateID, &e.EventType, &e.Payload); err != nil {
+		if err := rows.Scan(&e.ID, &e.EventID, &e.AggregateID, &e.EventType, &e.Payload, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

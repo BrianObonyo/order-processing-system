@@ -47,18 +47,23 @@ func run() error {
 	rds := redisinfra.New(cfg.RedisAddr)
 	defer rds.Close()
 
-	if err := kafkainfra.EnsureTopic(ctx, cfg.KafkaBrokers, cfg.KafkaTopic, 3); err != nil {
+	if err := kafkainfra.EnsureTopic(ctx, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaPartitions); err != nil {
+		return err
+	}
+	if err := kafkainfra.EnsureTopic(ctx, cfg.KafkaBrokers, cfg.KafkaDLQTopic, cfg.KafkaPartitions); err != nil {
 		return err
 	}
 	producer := kafkainfra.NewProducer(cfg.KafkaBrokers, cfg.KafkaTopic)
 	defer producer.Close()
+	dlqProducer := kafkainfra.NewProducer(cfg.KafkaBrokers, cfg.KafkaDLQTopic)
+	defer dlqProducer.Close()
 
 	// Modules.
 	orderSvc := services.NewOrderService(pool)
 	productSvc := services.NewProductService(pool)
 	gateway := services.NewResilientGateway(
 		services.NewSimulatedGateway(cfg.PaymentFailureRate, cfg.PaymentTransientRate, cfg.PaymentLatency),
-		3, 200*time.Millisecond,
+		cfg.PaymentGatewayAttempts, 200*time.Millisecond,
 	)
 	paymentSvc := services.NewPaymentService(pool, gateway)
 	recoverySvc := services.NewRecoveryService(pool, paymentSvc, cfg.OrderPaymentTimeout, cfg.PaymentRetryAfter, cfg.PaymentMaxRecovery)
@@ -70,10 +75,12 @@ func run() error {
 		go func() { defer wg.Done(); fn(ctx) }()
 	}
 	if cfg.RunWorkers {
-		consumer := kafkainfra.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID)
-		defer consumer.Close()
 		start(messaging.NewOutboxRelay(pool, producer, cfg.OutboxPollInterval).Run)
-		start(workers.NewPaymentConsumer(consumer, paymentSvc).Run)
+		for range cfg.PaymentConsumerWorkers {
+			start(func(ctx context.Context) {
+				runPaymentConsumer(ctx, cfg, paymentSvc, dlqProducer)
+			})
+		}
 		start(workers.NewRecoveryWorker(recoverySvc, rds, cfg.RecoveryInterval).Run)
 	}
 
@@ -112,4 +119,23 @@ func run() error {
 	stop()
 	wg.Wait()
 	return err
+}
+
+func runPaymentConsumer(ctx context.Context, cfg *config.Config, payments *services.PaymentService, dlq messaging.Publisher) {
+	for ctx.Err() == nil {
+		consumer := kafkainfra.NewConsumer(cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID)
+		err := workers.NewPaymentConsumer(consumer, payments, dlq).Run(ctx)
+		closeErr := consumer.Close()
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil || closeErr != nil {
+			slog.Error("payment consumer stopped; restarting", "err", errors.Join(err, closeErr))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
 }

@@ -57,10 +57,16 @@ POST /orders ──► PENDING_PAYMENT ──► PAID
 ```
 
 1. **API** (one DB transaction): claim the idempotency key, reserve stock, insert the order, write an `order.created` row to the outbox.
-2. **Outbox relay** publishes outbox rows to Kafka and marks them published.
-3. **Payment consumer** reads `order.created`, creates or loads the current payment attempt, and charges through a simulated gateway (retries + circuit breaker).
+2. **Outbox relay** publishes versioned event envelopes to Kafka and marks outbox rows published.
+3. **Payment consumer group** reads `order.created`, creates or loads the current payment attempt, and charges through a simulated gateway. Multiple group members process separate Kafka partitions concurrently while preserving order within each partition.
 4. **Success**: stock reservation becomes a real deduction, order becomes `PAID`. **Decline**: the attempt is recorded as `FAILED`; the order and stock reservation remain pending so another attempt can be started.
-5. **Recovery worker** re-emits events for stalled orders, checks the gateway before cancelling an order with an uncertain charge, and retries pending refunds. A late successful charge is refunded by the gateway before it is marked `REFUNDED`.
+5. **Recovery worker** re-emits events for stalled orders with a bounded delay/retry budget, checks the gateway before cancelling an order with an uncertain charge, and retries pending refunds. A late successful charge is refunded by the gateway before it is marked `REFUNDED`.
+
+### Event delivery and retries
+
+Every Kafka message uses an envelope containing an event ID, type, schema version, correlation ID, occurrence time, and event data. The event ID is stored with its outbox row, so duplicate publishes retain the same ID. Malformed supported events are sent to the configured dead-letter topic before their source offset is acknowledged.
+
+Payment and refund processing is attempted once per delivery; transient failures are retried by the database-backed recovery worker instead of sleeping and retrying inside a Kafka partition. `PAYMENT_CONSUMER_WORKERS` controls the number of group members (default 3); effective concurrency is limited by `KAFKA_PARTITIONS` (default 3). Existing Kafka topics are not resized automatically; coordinate partition increases with Kafka administration because changing a keyed topic's partition count can change key-to-partition assignments. `PAYMENT_GATEWAY_MAX_ATTEMPTS` defaults to 1 to avoid multiplying gateway retries by recovery retries.
 
 ### Payment reconciliation and refunds
 
@@ -76,7 +82,7 @@ If a charge succeeds after its order was cancelled, the payment moves to `REFUND
 
 Each charge is stored as a separate row in `payment_attempts`, with a per-order attempt number and its own provider idempotency key. A declined attempt remains in the history; `PaymentService.RetryPayment` creates a new attempt only after the previous attempt failed and while the order is still pending. The order's stock reservation is kept during this retry window and released only if recovery cancels the order.
 
-Order transitions are defined in the domain transition table and validated by the repository's `SetOrderStatus`. The `order_statuses` lookup table replaces the hard-coded SQL status check, and `order_status_history` records each new order's initial status and subsequent allowed transitions, including reason and timestamp. Existing orders receive a baseline snapshot during migration; earlier transitions cannot be reconstructed. Migrations `000003_payment_attempts` and `000004_order_state_history` add these structures.
+Order transitions are defined in the domain transition table and validated by the repository's `SetOrderStatus`. The `order_statuses` lookup table replaces the hard-coded SQL status check, and `order_status_history` records each new order's initial status and subsequent allowed transitions, including reason and timestamp. Existing orders receive a baseline snapshot during migration; earlier transitions cannot be reconstructed. Migrations `000003_payment_attempts` and `000004_order_state_history` add these structures. Migration `000005_event_envelopes` adds stable IDs to outbox events.
 
 ## How each objective is met
 
@@ -86,7 +92,7 @@ Order transitions are defined in the domain transition table and validated by th
 | Prevent duplicate orders | `Idempotency-Key` is claimed inside the order transaction (primary key `(user_id, key)`). Concurrent duplicates block on the unique index and then replay the stored order. Same key with a different body returns 422. |
 | Prevent duplicate charges and preserve attempt history | `payment_attempts` stores every charge attempt; `UNIQUE (order_id, attempt_number)` allocates distinct attempts and gateway calls are idempotent by attempt ID. |
 | Handle concurrent requests | Row-level locks, atomic updates, `FOR UPDATE SKIP LOCKED` in the relay, Redis lock to cheaply reject in-flight duplicates (fails open). |
-| Recover from failures | Transactional outbox (no lost events), at-least-once consumers that are idempotent, retry with backoff, circuit breaker, recovery worker with retry budget and timeout compensation. |
+| Recover from failures | Transactional outbox (no lost events), at-least-once consumers that are idempotent, dead-lettering for malformed events, circuit breaker, recovery worker with retry budget and timeout compensation. |
 | Consistent state across async steps | Every state change and its event commit in one transaction; transitions are validated by the domain state machine and recorded in `order_status_history`. |
 
 ## Layout

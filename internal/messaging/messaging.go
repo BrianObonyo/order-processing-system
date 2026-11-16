@@ -13,14 +13,14 @@ type Publisher interface {
 	Publish(ctx context.Context, msgs []Message) error
 }
 
-// Delivery is a received message plus the broker-specific handle needed to commit it.
-type Delivery struct {
-	Message Message
-	Raw     any
+// Delivery is a received message that can be acknowledged without exposing
+// broker-specific offset or receipt types to consumers.
+type Delivery interface {
+	Message() Message
+	Ack(ctx context.Context) error
 }
 
 type Consumer interface {
 	Fetch(ctx context.Context) (Delivery, error)
-	Commit(ctx context.Context, d Delivery) error
 	Close() error
 }

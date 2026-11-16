@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -104,7 +103,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 			return err
 		}
 		if err := q.InsertOutbox(ctx, o.ID, order.EventCreated, order.Event{
-			OrderID: o.ID, UserID: userID, TotalCents: o.TotalCents, OccurredAt: time.Now().UTC(),
+			OrderID: o.ID, UserID: userID, TotalCents: o.TotalCents,
 		}); err != nil {
 			return err
 		}
