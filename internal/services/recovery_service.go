@@ -16,26 +16,27 @@ import (
 // RecoveryService repairs orders that got stuck in PENDING_PAYMENT, for example
 // because a consumer crashed or the payment gateway was down for a while.
 type RecoveryService struct {
+	payments    *PaymentService
 	pool        *pgxpool.Pool
 	expireAfter time.Duration
 	retryAfter  time.Duration
 	maxRetries  int
 }
 
-func NewRecoveryService(pool *pgxpool.Pool, expireAfter, retryAfter time.Duration, maxRetries int) *RecoveryService {
-	return &RecoveryService{pool: pool, expireAfter: expireAfter, retryAfter: retryAfter, maxRetries: maxRetries}
+func NewRecoveryService(pool *pgxpool.Pool, payments *PaymentService, expireAfter, retryAfter time.Duration, maxRetries int) *RecoveryService {
+	return &RecoveryService{pool: pool, payments: payments, expireAfter: expireAfter, retryAfter: retryAfter, maxRetries: maxRetries}
 }
 
 type SweepResult struct {
-	Cancelled int
-	Retried   int
+	Cancelled     int
+	Retried       int
+	RefundRetried int
 }
 
 // Sweep runs one recovery pass:
-//  1. Compensation: cancel orders pending longer than expireAfter and release
-//     their stock reservation.
-//  2. Retry: re-emit order.created for orders idle longer than retryAfter that
-//     still have retry budget.
+//  1. Reconcile expired payments with the provider before cancelling an order.
+//  2. Re-emit pending refund requests that have exceeded retryAfter.
+//  3. Re-emit order.created for stalled orders that still have retry budget.
 //
 // Every step re-checks the order under a row lock, so Sweep is safe to run
 // concurrently with payment processing and on several instances at once.
@@ -48,20 +49,24 @@ func (s *RecoveryService) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, err
 	}
 	for _, id := range expired {
-		cancelled := false
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) (err error) {
-			cancelled, err = cancelPendingOrder(ctx, repositories.New(tx), id, "payment timed out")
-			return err
-		})
+		status, err := s.payments.ReconcileExpiredOrder(ctx, id)
 		if err != nil {
-			slog.Error("recovery: cancel failed", "order_id", id, "err", err)
+			slog.Error("recovery: payment reconciliation failed", "order_id", id, "err", err)
 			continue
 		}
-		if cancelled {
+		if status == order.StatusCancelled {
 			res.Cancelled++
 			metrics.RecoveryActions.WithLabelValues("cancelled").Inc()
 			slog.Info("recovery: cancelled stale order", "order_id", id)
 		}
+	}
+
+	res.RefundRetried, err = s.payments.RequeuePendingRefunds(ctx, s.retryAfter)
+	for range res.RefundRetried {
+		metrics.RecoveryActions.WithLabelValues("refund_retried").Inc()
+	}
+	if err != nil {
+		return res, err
 	}
 
 	stalled, err := q.ListStalledOrders(ctx, time.Now().Add(-s.retryAfter), s.maxRetries, 100)
@@ -92,6 +97,9 @@ func (s *RecoveryService) Sweep(ctx context.Context) (SweepResult, error) {
 			res.Retried++
 			metrics.RecoveryActions.WithLabelValues("retried").Inc()
 		}
+	}
+	if res.Cancelled > 0 || res.Retried > 0 || res.RefundRetried > 0 {
+		slog.Info("recovery sweep", "cancelled", res.Cancelled, "retried", res.Retried, "refund_retried", res.RefundRetried)
 	}
 	return res, nil
 }

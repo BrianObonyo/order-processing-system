@@ -110,6 +110,10 @@ func (q *Queries) ListStalledOrders(ctx context.Context, idleBefore time.Time, m
 	return q.listIDs(ctx, `
 		SELECT id::text FROM orders
 		WHERE status = 'PENDING_PAYMENT' AND updated_at < $1 AND recovery_attempts < $2
+		  AND NOT EXISTS (
+		      SELECT 1 FROM payments p
+		      WHERE p.order_id = orders.id AND p.status = 'RECONCILING'
+		  )
 		ORDER BY updated_at LIMIT $3`, idleBefore, maxAttempts, limit)
 }
 

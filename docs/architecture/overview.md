@@ -10,6 +10,8 @@ sequenceDiagram
   participant R as Outbox relay
   participant K as Kafka
   participant W as Payment consumer
+  participant G as Payment gateway
+  participant X as Recovery worker
   C->>A: POST /orders (Idempotency-Key)
   A->>P: TX: claim key, reserve stock, insert order, insert outbox row
   A-->>C: 201 PENDING_PAYMENT
@@ -18,14 +20,21 @@ sequenceDiagram
   R->>P: mark published
   K->>W: order.created (at-least-once)
   W->>P: TX: insert payment (once per order)
-  W->>W: charge gateway (retry + circuit breaker)
+  W->>G: charge (retry + circuit breaker)
   W->>P: TX: order PAID + commit stock + outbox order.paid
+  X->>G: look up uncertain charge before cancellation
+  W->>P: TX: late charge -> REFUND_PENDING + outbox refund request
+  R->>K: publish payment.refund_requested
+  K->>W: payment.refund_requested
+  W->>G: refund (idempotent by payment ID)
+  W->>P: TX: mark REFUNDED + outbox payment.refunded
 ```
 
 ## Decisions
 
 - **Reserve, then commit.** `inventory.reserved` holds stock for pending orders; payment success converts it to a deduction, failure or timeout releases it.
 - **One path for terminal transitions.** `cancelPendingOrder` and `markOrderPaid` lock the order row and re-check status, so payment completion and recovery can race safely.
-- **Gateway outside transactions.** No DB locks are held during the external call; idempotency comes from keying the charge by payment ID.
-- **Late payment compensation.** If a charge succeeds after the order was cancelled, the payment is marked `REFUNDED` and a `payment.refunded` event is emitted.
+- **Gateway outside transactions.** No DB locks are held during external calls; charge and refund operations are idempotent on payment ID.
+- **Late payment compensation.** If a charge succeeds after cancellation, the payment enters `REFUND_PENDING`; a refund request is sent to the gateway and only then transitions to `REFUNDED`. Failed requests are retried by recovery.
+- **Unknown charge outcome.** Before cancelling an expired order with a processing payment, recovery marks it `RECONCILING` and queries the gateway. A confirmed charge completes the order, a confirmed decline/absence permits cancellation, and a pending or unavailable lookup leaves the order pending.
 - **Single topic, keyed by order ID.** Per-order ordering within a partition; consumers filter by `event_type` header.

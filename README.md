@@ -60,7 +60,7 @@ POST /orders ──► PENDING_PAYMENT ──► PAID
 2. **Outbox relay** publishes outbox rows to Kafka and marks them published.
 3. **Payment consumer** reads `order.created`, charges the order through a simulated gateway (retries + circuit breaker).
 4. **Success**: stock reservation becomes a real deduction, order becomes `PAID`. **Decline**: reservation released, order `CANCELLED`.
-5. **Recovery worker** re-emits events for stalled orders, cancels orders that stay pending past the timeout, and refunds a payment that succeeds after its order was cancelled.
+5. **Recovery worker** re-emits events for stalled orders, checks the gateway before cancelling an order with an uncertain charge, and retries pending refunds. A late successful charge is refunded by the gateway before it is marked `REFUNDED`.
 
 ## How each objective is met
 

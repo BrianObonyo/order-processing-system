@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -77,24 +78,95 @@ func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error
 }
 
 func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID string) error {
-	refunded := false
+	refundPending := false
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		q := repositories.New(tx)
-		paid, err := markOrderPaid(ctx, q, orderID)
+		o, err := q.LockOrder(ctx, orderID)
 		if err != nil {
 			return err
 		}
-		if paid {
+		switch o.Status {
+		case order.StatusPendingPayment:
+			paid, err := markOrderPaid(ctx, q, orderID)
+			if err != nil {
+				return err
+			}
+			if !paid {
+				return nil
+			}
+			return q.SetPaymentResult(ctx, paymentID, payment.StatusSucceeded, "")
+		case order.StatusPaid:
 			return q.SetPaymentResult(ctx, paymentID, payment.StatusSucceeded, "")
 		}
 		// The order was cancelled (e.g. payment timeout) while the charge was in
-		// flight: compensate by refunding instead of keeping the money.
-		refunded = true
-		if err := q.SetPaymentResult(ctx, paymentID, payment.StatusRefunded, "order no longer pending"); err != nil {
+		// flight: durably request a refund instead of keeping the money.
+		refundPending = true
+		pay, err := q.GetPaymentByID(ctx, paymentID)
+		if err != nil {
 			return err
 		}
-		return q.InsertOutbox(ctx, orderID, order.EventPaymentRefunded, order.Event{
-			OrderID: orderID, Reason: "order no longer pending", OccurredAt: time.Now().UTC(),
+		if pay.Status == payment.StatusRefunded || pay.Status == payment.StatusRefundPending {
+			return nil
+		}
+		changed, err := q.TransitionPaymentStatus(ctx, paymentID, pay.Status, payment.StatusRefundPending, "order no longer pending")
+		if err != nil {
+			return err
+		}
+		if !changed {
+			pay, err = q.GetPaymentByID(ctx, paymentID)
+			if err != nil {
+				return err
+			}
+			if pay.Status == payment.StatusRefunded || pay.Status == payment.StatusRefundPending {
+				return nil
+			}
+			return fmt.Errorf("payment %s changed state while scheduling refund", paymentID)
+		}
+		return q.InsertOutbox(ctx, orderID, order.EventPaymentRefundRequested, order.Event{
+			OrderID: orderID, PaymentID: paymentID, TotalCents: pay.AmountCents,
+			Reason: "order no longer pending", OccurredAt: time.Now().UTC(),
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if refundPending {
+		return s.ProcessRefund(ctx, paymentID)
+	}
+	metrics.PaymentsProcessed.WithLabelValues("succeeded").Inc()
+	return nil
+}
+
+// ProcessRefund performs a durable refund request. The provider operation is
+// idempotent on paymentID, so a retry after a crash cannot refund twice.
+func (s *PaymentService) ProcessRefund(ctx context.Context, paymentID string) error {
+	pay, err := repositories.New(s.pool).GetPaymentByID(ctx, paymentID)
+	if err != nil {
+		return err
+	}
+	if pay.Status == payment.StatusRefunded {
+		return nil
+	}
+	if pay.Status != payment.StatusRefundPending {
+		return nil
+	}
+	if err := s.gateway.Refund(ctx, pay.ID, pay.AmountCents); err != nil {
+		if touchErr := repositories.New(s.pool).TouchPendingRefund(ctx, paymentID); touchErr != nil {
+			return errors.Join(err, touchErr)
+		}
+		return err
+	}
+
+	refunded := false
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		q := repositories.New(tx)
+		refunded, err = q.TransitionPaymentStatus(ctx, paymentID, payment.StatusRefundPending, payment.StatusRefunded, "")
+		if err != nil || !refunded {
+			return err
+		}
+		return q.InsertOutbox(ctx, pay.OrderID, order.EventPaymentRefunded, order.Event{
+			OrderID: pay.OrderID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
+			Reason: "order no longer pending", OccurredAt: time.Now().UTC(),
 		})
 	})
 	if err != nil {
@@ -102,10 +174,138 @@ func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID
 	}
 	if refunded {
 		metrics.PaymentsProcessed.WithLabelValues("refunded").Inc()
-	} else {
-		metrics.PaymentsProcessed.WithLabelValues("succeeded").Inc()
 	}
 	return nil
+}
+
+// ReconcileExpiredOrder queries the provider before recovery cancels an order.
+// It returns the order's resulting status; a pending status means the provider
+// could not yet establish a final charge outcome and cancellation must wait.
+func (s *PaymentService) ReconcileExpiredOrder(ctx context.Context, orderID string) (order.Status, error) {
+	var pay *payment.Payment
+	var currentStatus order.Status
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		q := repositories.New(tx)
+		o, err := q.LockOrder(ctx, orderID)
+		if err != nil {
+			return err
+		}
+		currentStatus = o.Status
+		if o.Status != order.StatusPendingPayment {
+			return nil
+		}
+
+		pay, err = q.GetPaymentByOrder(ctx, orderID)
+		if errors.Is(err, payment.ErrNotFound) {
+			cancelled, cancelErr := cancelPendingOrder(ctx, q, orderID, "payment timed out")
+			if cancelled {
+				currentStatus = order.StatusCancelled
+			}
+			return cancelErr
+		}
+		if err != nil {
+			return err
+		}
+
+		switch pay.Status {
+		case payment.StatusProcessing:
+			_, err = q.TransitionPaymentStatus(ctx, pay.ID, payment.StatusProcessing, payment.StatusReconciling, "")
+		case payment.StatusReconciling:
+			return nil
+		case payment.StatusFailed:
+			cancelled, cancelErr := cancelPendingOrder(ctx, q, orderID, "payment failed")
+			if cancelled {
+				currentStatus = order.StatusCancelled
+			}
+			return cancelErr
+		case payment.StatusSucceeded:
+			paid, markErr := markOrderPaid(ctx, q, orderID)
+			if markErr == nil && paid {
+				currentStatus = order.StatusPaid
+			}
+			return markErr
+		default:
+			return nil
+		}
+		return err
+	})
+	if err != nil || currentStatus != order.StatusPendingPayment || pay == nil {
+		return currentStatus, err
+	}
+
+	chargeStatus, err := s.gateway.GetCharge(ctx, pay.ID)
+	if err != nil {
+		return currentStatus, err
+	}
+	switch chargeStatus {
+	case payment.ChargeStatusSucceeded:
+		if err := s.finalizeSuccess(ctx, orderID, pay.ID); err != nil {
+			return currentStatus, err
+		}
+		return s.currentOrderStatus(ctx, orderID)
+	case payment.ChargeStatusDeclined, payment.ChargeStatusNotFound:
+		err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			_, err := cancelPendingOrder(ctx, repositories.New(tx), orderID, "payment timed out")
+			return err
+		})
+		if err != nil {
+			return currentStatus, err
+		}
+		return s.currentOrderStatus(ctx, orderID)
+	case payment.ChargeStatusPending:
+		return currentStatus, nil
+	default:
+		return currentStatus, fmt.Errorf("gateway returned unsupported charge status %q", chargeStatus)
+	}
+}
+
+func (s *PaymentService) currentOrderStatus(ctx context.Context, orderID string) (order.Status, error) {
+	o, err := repositories.New(s.pool).GetOrder(ctx, orderID)
+	if err != nil {
+		return "", err
+	}
+	return o.Status, nil
+}
+
+// RequeuePendingRefunds republishes durable refund requests after their retry
+// delay. The payment's updated_at timestamp bounds retries when the provider is
+// unavailable or a refund event cannot be processed.
+func (s *PaymentService) RequeuePendingRefunds(ctx context.Context, retryAfter time.Duration) (int, error) {
+	q := repositories.New(s.pool)
+	ids, err := q.ListStaleRefunds(ctx, time.Now().Add(-retryAfter), 100)
+	if err != nil {
+		return 0, err
+	}
+	requeued := 0
+	for _, id := range ids {
+		scheduled := false
+		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			tq := repositories.New(tx)
+			claimed, err := tq.ScheduleRefundRetry(ctx, id, time.Now().Add(-retryAfter))
+			if err != nil || !claimed {
+				return err
+			}
+			pay, err := tq.GetPaymentByID(ctx, id)
+			if err != nil {
+				return err
+			}
+			if err := tq.InsertOutbox(ctx, pay.OrderID, order.EventPaymentRefundRequested, order.Event{
+				OrderID: pay.OrderID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
+				Reason: pay.FailureReason, OccurredAt: time.Now().UTC(),
+			}); err != nil {
+				return err
+			}
+			scheduled = true
+			return nil
+		})
+		if err != nil {
+			return requeued, err
+		}
+		if scheduled {
+			requeued++
+		}
+	}
+	return requeued, nil
 }
 
 func (s *PaymentService) finalizeFailure(ctx context.Context, orderID, reason string) error {

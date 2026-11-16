@@ -6,6 +6,7 @@ package testutil
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -109,8 +110,27 @@ func Count(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
 }
 
 // StubGateway is a payment.Gateway with a fixed outcome.
-type StubGateway struct{ Err error }
+type StubGateway struct {
+	Err         error
+	ChargeState payment.ChargeStatus
+	RefundErr   error
+}
 
 func (g StubGateway) Charge(context.Context, string, int64) error { return g.Err }
+
+func (g StubGateway) Refund(context.Context, string, int64) error { return g.RefundErr }
+
+func (g StubGateway) GetCharge(context.Context, string) (payment.ChargeStatus, error) {
+	if g.ChargeState != "" {
+		return g.ChargeState, nil
+	}
+	if errors.Is(g.Err, payment.ErrDeclined) {
+		return payment.ChargeStatusDeclined, nil
+	}
+	if g.Err == nil {
+		return payment.ChargeStatusSucceeded, nil
+	}
+	return payment.ChargeStatusPending, nil
+}
 
 var _ payment.Gateway = StubGateway{}

@@ -61,7 +61,7 @@ func run() error {
 		3, 200*time.Millisecond,
 	)
 	paymentSvc := services.NewPaymentService(pool, gateway)
-	recoverySvc := services.NewRecoveryService(pool, cfg.OrderPaymentTimeout, cfg.PaymentRetryAfter, cfg.PaymentMaxRecovery)
+	recoverySvc := services.NewRecoveryService(pool, paymentSvc, cfg.OrderPaymentTimeout, cfg.PaymentRetryAfter, cfg.PaymentMaxRecovery)
 
 	// Background workers.
 	var wg sync.WaitGroup

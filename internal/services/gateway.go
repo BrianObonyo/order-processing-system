@@ -22,13 +22,15 @@ type SimulatedGateway struct {
 	latency       time.Duration
 
 	mu      sync.Mutex
-	results map[string]error
+	results map[string]payment.ChargeStatus
+	refunds map[string]bool
 }
 
 func NewSimulatedGateway(declineRate, transientRate float64, latency time.Duration) *SimulatedGateway {
 	return &SimulatedGateway{
 		declineRate: declineRate, transientRate: transientRate, latency: latency,
-		results: make(map[string]error),
+		results: make(map[string]payment.ChargeStatus),
+		refunds: make(map[string]bool),
 	}
 }
 
@@ -41,19 +43,68 @@ func (g *SimulatedGateway) Charge(ctx context.Context, key string, _ int64) erro
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if res, ok := g.results[key]; ok {
-		return res
+	if status, ok := g.results[key]; ok {
+		switch status {
+		case payment.ChargeStatusSucceeded:
+			return nil
+		case payment.ChargeStatusDeclined:
+			return payment.ErrDeclined
+		default:
+			return payment.ErrTransient
+		}
 	}
 	roll := rand.Float64()
 	switch {
 	case roll < g.declineRate:
-		g.results[key] = payment.ErrDeclined
+		g.results[key] = payment.ChargeStatusDeclined
 		return payment.ErrDeclined
 	case roll < g.declineRate+g.transientRate:
 		return payment.ErrTransient // not remembered: a retry may succeed
 	default:
-		g.results[key] = nil
+		g.results[key] = payment.ChargeStatusSucceeded
 		return nil
+	}
+}
+
+func (g *SimulatedGateway) Refund(ctx context.Context, paymentID string, _ int64) error {
+	if err := g.wait(ctx); err != nil {
+		return err
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.refunds[paymentID] {
+		return nil
+	}
+	if g.results[paymentID] != payment.ChargeStatusSucceeded {
+		return errors.New("cannot refund a charge that did not succeed")
+	}
+	if rand.Float64() < g.transientRate {
+		return payment.ErrTransient
+	}
+	g.refunds[paymentID] = true
+	return nil
+}
+
+func (g *SimulatedGateway) GetCharge(ctx context.Context, key string) (payment.ChargeStatus, error) {
+	if err := g.wait(ctx); err != nil {
+		return "", err
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if status, ok := g.results[key]; ok {
+		return status, nil
+	}
+	return payment.ChargeStatusNotFound, nil
+}
+
+func (g *SimulatedGateway) wait(ctx context.Context) error {
+	select {
+	case <-time.After(g.latency):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -116,4 +167,40 @@ func (g *ResilientGateway) Charge(ctx context.Context, key string, amountCents i
 		delay *= 2
 	}
 	return fmt.Errorf("charge failed after %d attempts: %w", g.maxAttempts, errors.Join(payment.ErrTransient, last))
+}
+
+func (g *ResilientGateway) Refund(ctx context.Context, paymentID string, amountCents int64) error {
+	delay := g.baseDelay
+	for attempt := 1; attempt <= g.maxAttempts; attempt++ {
+		_, err := g.breaker.Execute(func() (any, error) {
+			return nil, g.inner.Refund(ctx, paymentID, amountCents)
+		})
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, payment.ErrTransient) || attempt == g.maxAttempts {
+			return fmt.Errorf("refund failed after %d attempts: %w", attempt, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return fmt.Errorf("refund failed after %d attempts", g.maxAttempts)
+}
+
+func (g *ResilientGateway) GetCharge(ctx context.Context, key string) (payment.ChargeStatus, error) {
+	result, err := g.breaker.Execute(func() (any, error) {
+		return g.inner.GetCharge(ctx, key)
+	})
+	if err != nil {
+		return "", err
+	}
+	status, ok := result.(payment.ChargeStatus)
+	if !ok {
+		return "", errors.New("payment gateway returned an invalid charge status")
+	}
+	return status, nil
 }

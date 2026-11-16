@@ -9,11 +9,12 @@ import (
 	"time"
 
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
+	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/messaging"
 	"github.com/BrianObonyo/order-processing-system/internal/services"
 )
 
-// PaymentConsumer reads order.created events and charges the order.
+// PaymentConsumer reads order and payment events and applies them idempotently.
 type PaymentConsumer struct {
 	consumer    messaging.Consumer
 	payments    *services.PaymentService
@@ -51,7 +52,7 @@ func (w *PaymentConsumer) Run(ctx context.Context) {
 }
 
 func (w *PaymentConsumer) handle(ctx context.Context, m messaging.Message) {
-	if m.Type != order.EventCreated {
+	if m.Type != order.EventCreated && m.Type != order.EventPaymentRefundRequested {
 		return // other event types are for other consumers
 	}
 	var ev order.Event
@@ -59,14 +60,23 @@ func (w *PaymentConsumer) handle(ctx context.Context, m messaging.Message) {
 		slog.Error("payment consumer: dropping malformed event", "err", err)
 		return
 	}
+	if m.Type == order.EventPaymentRefundRequested && ev.PaymentID == "" {
+		slog.Error("payment consumer: dropping refund event without payment_id", "order_id", ev.OrderID)
+		return
+	}
 
 	backoff := 200 * time.Millisecond
 	for attempt := 1; attempt <= w.maxAttempts; attempt++ {
-		err := w.payments.ProcessOrder(ctx, ev.OrderID)
-		if err == nil || errors.Is(err, order.ErrNotFound) {
+		var err error
+		if m.Type == order.EventPaymentRefundRequested {
+			err = w.payments.ProcessRefund(ctx, ev.PaymentID)
+		} else {
+			err = w.payments.ProcessOrder(ctx, ev.OrderID)
+		}
+		if err == nil || errors.Is(err, order.ErrNotFound) || errors.Is(err, payment.ErrNotFound) {
 			return
 		}
-		slog.Warn("payment consumer: processing failed", "order_id", ev.OrderID, "attempt", attempt, "err", err)
+		slog.Warn("payment consumer: processing failed", "order_id", ev.OrderID, "payment_id", ev.PaymentID, "attempt", attempt, "err", err)
 		select {
 		case <-ctx.Done():
 			return
@@ -75,5 +85,5 @@ func (w *PaymentConsumer) handle(ctx context.Context, m messaging.Message) {
 		backoff *= 2
 	}
 	// Give up for now. The recovery worker re-emits the event or times the order out.
-	slog.Error("payment consumer: giving up, recovery will retry", "order_id", ev.OrderID)
+	slog.Error("payment consumer: giving up, recovery will retry", "order_id", ev.OrderID, "payment_id", ev.PaymentID)
 }
