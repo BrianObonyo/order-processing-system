@@ -10,6 +10,7 @@ import (
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/middleware"
+	"github.com/BrianObonyo/order-processing-system/internal/services"
 )
 
 func respondError(c *gin.Context, status int, code, msg string, extra ...any) {
@@ -33,6 +34,10 @@ func handleServiceError(c *gin.Context, err error) {
 		respondError(c, http.StatusUnprocessableEntity, "idempotency_key_reuse", err.Error())
 	case errors.Is(err, order.ErrNotFound):
 		respondError(c, http.StatusNotFound, "order_not_found", "order not found")
+	case errors.Is(err, services.ErrOrderNotCancelable):
+		respondError(c, http.StatusConflict, "order_not_cancelable", "order cannot be cancelled in its current state")
+	case errors.Is(err, services.ErrInvalidPagination):
+		respondError(c, http.StatusBadRequest, "invalid_pagination", "pagination values are out of range")
 	default:
 		slog.Error("unhandled error", "request_id", middleware.RequestIDValue(c), "path", c.FullPath(), "err", err)
 		respondError(c, http.StatusInternalServerError, "internal_error", "something went wrong")

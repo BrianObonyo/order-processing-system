@@ -7,22 +7,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/metrics"
-	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 )
 
 type PaymentService struct {
-	pool    *pgxpool.Pool
-	gateway payment.Gateway
+	repository Repository
+	gateway    payment.Gateway
 }
 
-func NewPaymentService(pool *pgxpool.Pool, gw payment.Gateway) *PaymentService {
-	return &PaymentService{pool: pool, gateway: gw}
+func NewPaymentService(repository Repository, gw payment.Gateway) *PaymentService {
+	return &PaymentService{repository: repository, gateway: gw}
 }
 
 var errSkip = errors.New("skip: order is not pending")
@@ -40,8 +37,7 @@ var errSkip = errors.New("skip: order is not pending")
 // recovery worker re-emits the event later, and finally times the order out.
 func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error {
 	var pay *payment.Payment
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
+	err := s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		o, err := q.LockOrder(ctx, orderID)
 		if err != nil {
 			return err
@@ -84,8 +80,7 @@ func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error
 // pending, and the previous attempt remains available for audit.
 func (s *PaymentService) RetryPayment(ctx context.Context, orderID string) (*payment.Payment, error) {
 	var attempt *payment.Payment
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
+	err := s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		o, err := q.LockOrder(ctx, orderID)
 		if err != nil {
 			return err
@@ -122,8 +117,7 @@ func (s *PaymentService) RetryPayment(ctx context.Context, orderID string) (*pay
 
 func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID string) error {
 	refundPending := false
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
+	err := s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		o, err := q.LockOrder(ctx, orderID)
 		if err != nil {
 			return err
@@ -183,7 +177,7 @@ func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID
 // ProcessRefund performs a durable refund request. The provider operation is
 // idempotent on paymentID, so a retry after a crash cannot refund twice.
 func (s *PaymentService) ProcessRefund(ctx context.Context, paymentID string) error {
-	pay, err := repositories.New(s.pool).GetPaymentByID(ctx, paymentID)
+	pay, err := s.repository.GetPaymentByID(ctx, paymentID)
 	if err != nil {
 		return err
 	}
@@ -194,15 +188,14 @@ func (s *PaymentService) ProcessRefund(ctx context.Context, paymentID string) er
 		return nil
 	}
 	if err := s.gateway.Refund(ctx, pay.ID, pay.AmountCents); err != nil {
-		if touchErr := repositories.New(s.pool).TouchPendingRefund(ctx, paymentID); touchErr != nil {
+		if touchErr := s.repository.TouchPendingRefund(ctx, paymentID); touchErr != nil {
 			return errors.Join(err, touchErr)
 		}
 		return err
 	}
 
 	refunded := false
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
+	err = s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		refunded, err = q.TransitionPaymentStatus(ctx, paymentID, payment.StatusRefundPending, payment.StatusRefunded, "")
 		if err != nil || !refunded {
 			return err
@@ -227,8 +220,7 @@ func (s *PaymentService) ProcessRefund(ctx context.Context, paymentID string) er
 func (s *PaymentService) ReconcileExpiredOrder(ctx context.Context, orderID string) (order.Status, error) {
 	var pay *payment.Payment
 	var currentStatus order.Status
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
+	err := s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		o, err := q.LockOrder(ctx, orderID)
 		if err != nil {
 			return err
@@ -287,8 +279,8 @@ func (s *PaymentService) ReconcileExpiredOrder(ctx context.Context, orderID stri
 		}
 		return s.currentOrderStatus(ctx, orderID)
 	case payment.ChargeStatusDeclined, payment.ChargeStatusNotFound:
-		err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			_, err := cancelPendingOrder(ctx, repositories.New(tx), orderID, "payment timed out")
+		err = s.repository.WithinTransaction(ctx, func(q Transaction) error {
+			_, err := cancelPendingOrder(ctx, q, orderID, "payment timed out")
 			return err
 		})
 		if err != nil {
@@ -303,7 +295,7 @@ func (s *PaymentService) ReconcileExpiredOrder(ctx context.Context, orderID stri
 }
 
 func (s *PaymentService) currentOrderStatus(ctx context.Context, orderID string) (order.Status, error) {
-	o, err := repositories.New(s.pool).GetOrder(ctx, orderID)
+	o, err := s.repository.GetOrder(ctx, orderID)
 	if err != nil {
 		return "", err
 	}
@@ -314,16 +306,14 @@ func (s *PaymentService) currentOrderStatus(ctx context.Context, orderID string)
 // delay. The payment's updated_at timestamp bounds retries when the provider is
 // unavailable or a refund event cannot be processed.
 func (s *PaymentService) RequeuePendingRefunds(ctx context.Context, retryAfter time.Duration) (int, error) {
-	q := repositories.New(s.pool)
-	ids, err := q.ListStaleRefunds(ctx, time.Now().Add(-retryAfter), 100)
+	ids, err := s.repository.ListStaleRefunds(ctx, time.Now().Add(-retryAfter), 100)
 	if err != nil {
 		return 0, err
 	}
 	requeued := 0
 	for _, id := range ids {
 		scheduled := false
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			tq := repositories.New(tx)
+		err := s.repository.WithinTransaction(ctx, func(tq Transaction) error {
 			claimed, err := tq.ScheduleRefundRetry(ctx, id, time.Now().Add(-retryAfter))
 			if err != nil || !claimed {
 				return err
@@ -352,8 +342,7 @@ func (s *PaymentService) RequeuePendingRefunds(ctx context.Context, retryAfter t
 }
 
 func (s *PaymentService) finalizeFailure(ctx context.Context, paymentID, reason string) error {
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
+	err := s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		pay, err := q.GetPaymentByID(ctx, paymentID)
 		if err != nil {
 			return err

@@ -1,14 +1,19 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/BrianObonyo/order-processing-system/internal/services"
+	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 )
 
-type ProductHandler struct{ svc *services.ProductService }
+type ProductAPI interface {
+	List(context.Context) ([]inventory.ProductStock, error)
+}
+
+type ProductHandler struct{ svc ProductAPI }
 
 func (h *ProductHandler) List(c *gin.Context) {
 	products, err := h.svc.List(c.Request.Context())

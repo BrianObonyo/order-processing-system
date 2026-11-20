@@ -26,7 +26,7 @@ import (
 // The same Idempotency-Key sent 20 times in parallel creates exactly one order.
 func TestIdempotentCreateUnderConcurrency(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	svc := services.NewOrderService(pool)
+	svc := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 100)
 	items := []order.CreateItem{{ProductID: product, Quantity: 3}}
 	key := "idem-" + uuid.NewString()
@@ -73,7 +73,7 @@ func TestIdempotentCreateUnderConcurrency(t *testing.T) {
 // Rejected orders leave no trace: stock, order rows and the idempotency key roll back together.
 func TestRejectedOrderRollsBackEverything(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	svc := services.NewOrderService(pool)
+	svc := services.NewOrderService(testutil.Store(pool))
 	plenty := testutil.SeedProduct(t, pool, 100)
 	scarce := testutil.SeedProduct(t, pool, 1)
 
@@ -91,10 +91,132 @@ func TestRejectedOrderRollsBackEverything(t *testing.T) {
 	}
 }
 
+func TestCustomPricingPolicyIsAppliedToOrderTotal(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	store := testutil.Store(pool)
+	orders := services.NewOrderService(store, services.WithPricingPolicy(services.PricingFunc(
+		func(ctx context.Context, request services.OrderPricingRequest) (services.OrderPricingResult, error) {
+			result, err := (services.CatalogPricing{}).Price(ctx, request)
+			if err != nil {
+				return services.OrderPricingResult{}, err
+			}
+			result.TotalCents += 250
+			return result, nil
+		},
+	)))
+	product := testutil.SeedProduct(t, pool, 5)
+
+	result, err := orders.CreateOrder(context.Background(), "user-1", "key-custom-pricing-1",
+		[]order.CreateItem{{ProductID: product, Quantity: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Order.TotalCents != 2250 {
+		t.Fatalf("total_cents=%d, want 2250 including policy surcharge", result.Order.TotalCents)
+	}
+	if result.Order.Items[0].UnitPriceCents != 1000 {
+		t.Fatalf("unit_price_cents=%d, want catalog price 1000", result.Order.Items[0].UnitPriceCents)
+	}
+	if _, reserved := testutil.Stock(t, pool, product); reserved != 2 {
+		t.Fatalf("reserved=%d, want 2", reserved)
+	}
+}
+
+func TestOrderValidatorCanRejectBeforePersistence(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	orders := services.NewOrderService(testutil.Store(pool), services.WithOrderValidator(
+		services.OrderValidatorFunc(func(context.Context, string, []order.CreateItem) error {
+			return errors.New("order rejected by policy")
+		}),
+	))
+	product := testutil.SeedProduct(t, pool, 5)
+
+	_, err := orders.CreateOrder(context.Background(), "user-1", "key-policy-reject-1",
+		[]order.CreateItem{{ProductID: product, Quantity: 2}})
+	if err == nil {
+		t.Fatal("expected policy rejection")
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM orders`); n != 0 {
+		t.Fatalf("orders=%d, want no persisted order after rejection", n)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM idempotency_keys`); n != 0 {
+		t.Fatalf("idempotency keys=%d, want transaction rollback after rejection", n)
+	}
+	if _, reserved := testutil.Stock(t, pool, product); reserved != 0 {
+		t.Fatalf("reserved=%d, want no stock reservation after rejection", reserved)
+	}
+}
+
+func TestListOrdersPaginatesAndScopesToUser(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	orders := services.NewOrderService(testutil.Store(pool))
+	product := testutil.SeedProduct(t, pool, 10)
+	for _, userID := range []string{"user-1", "user-1", "user-1", "user-2"} {
+		if _, err := orders.CreateOrder(context.Background(), userID, uuid.NewString(),
+			[]order.CreateItem{{ProductID: product, Quantity: 1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstPage, err := orders.ListOrders(context.Background(), "user-1", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPage.Total != 3 || len(firstPage.Orders) != 2 || firstPage.Page != 1 {
+		t.Fatalf("first page=%+v, want total 3 and 2 orders", firstPage)
+	}
+	secondPage, err := orders.ListOrders(context.Background(), "user-1", 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondPage.Total != 3 || len(secondPage.Orders) != 1 || secondPage.Page != 2 {
+		t.Fatalf("second page=%+v, want total 3 and 1 order", secondPage)
+	}
+	for _, listed := range append(firstPage.Orders, secondPage.Orders...) {
+		if listed.UserID != "user-1" {
+			t.Fatalf("listed order belongs to %q, want user-1", listed.UserID)
+		}
+	}
+}
+
+func TestCancelPendingOrderReleasesStockAndIsRecorded(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	orders := services.NewOrderService(testutil.Store(pool))
+	product := testutil.SeedProduct(t, pool, 5)
+	result, err := orders.CreateOrder(context.Background(), "user-1", "key-cancel-order-1",
+		[]order.CreateItem{{ProductID: product, Quantity: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := orders.CancelOrder(context.Background(), "user-1", result.Order.ID); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := orders.GetOrder(context.Background(), "user-1", result.Order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Status != order.StatusCancelled {
+		t.Fatalf("status=%s, want CANCELLED", cancelled.Status)
+	}
+	if _, reserved := testutil.Stock(t, pool, product); reserved != 0 {
+		t.Fatalf("reserved=%d, want 0 after cancellation", reserved)
+	}
+	if n := testutil.Count(t, pool, `SELECT count(*) FROM order_status_history WHERE order_id = $1 AND to_status = 'CANCELLED'`, result.Order.ID); n != 1 {
+		t.Fatalf("cancel status history rows=%d, want 1", n)
+	}
+	if err := orders.CancelOrder(context.Background(), "user-1", result.Order.ID); !errors.Is(err, services.ErrOrderNotCancelable) {
+		t.Fatalf("second cancel error=%v, want ErrOrderNotCancelable", err)
+	}
+	if err := orders.CancelOrder(context.Background(), "other-user", result.Order.ID); !errors.Is(err, order.ErrNotFound) {
+		t.Fatalf("other user's cancel error=%v, want not found", err)
+	}
+}
+
 func TestPaymentSuccessAndDuplicateDelivery(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
-	payments := services.NewPaymentService(pool, testutil.StubGateway{})
+	orders := services.NewOrderService(testutil.Store(pool))
+	payments := services.NewPaymentService(testutil.Store(pool), testutil.StubGateway{})
 	product := testutil.SeedProduct(t, pool, 10)
 
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-pay-0001",
@@ -123,8 +245,8 @@ func TestPaymentSuccessAndDuplicateDelivery(t *testing.T) {
 
 func TestPaymentDeclinedLeavesOrderRetryable(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
-	payments := services.NewPaymentService(pool, testutil.StubGateway{Err: payment.ErrDeclined})
+	orders := services.NewOrderService(testutil.Store(pool))
+	payments := services.NewPaymentService(testutil.Store(pool), testutil.StubGateway{Err: payment.ErrDeclined})
 	product := testutil.SeedProduct(t, pool, 10)
 
 	res, _ := orders.CreateOrder(context.Background(), "user-1", "key-decl-001",
@@ -147,9 +269,9 @@ func TestPaymentDeclinedLeavesOrderRetryable(t *testing.T) {
 
 func TestPaymentRetryCreatesNewAttemptAndKeepsHistory(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	orders := services.NewOrderService(testutil.Store(pool))
 	gateway := &sequenceGateway{outcomes: []error{payment.ErrDeclined, nil}}
-	payments := services.NewPaymentService(pool, gateway)
+	payments := services.NewPaymentService(testutil.Store(pool), gateway)
 	product := testutil.SeedProduct(t, pool, 10)
 
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-payment-retry-1",
@@ -191,7 +313,7 @@ func TestPaymentRetryCreatesNewAttemptAndKeepsHistory(t *testing.T) {
 
 func TestSetOrderStatusRejectsInvalidTransitionWithoutHistory(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 1)
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-status-history-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
@@ -246,7 +368,7 @@ func (p *recordingPublisher) Publish(_ context.Context, m []messaging.Message) e
 // An order and its event commit together; the relay then publishes each event once.
 func TestOutboxRelayPublishesEachEventOnce(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 10)
 
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-outbox-1",

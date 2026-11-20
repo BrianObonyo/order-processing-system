@@ -3,16 +3,15 @@ package services
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
-	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 )
 
-type ProductService struct{ pool *pgxpool.Pool }
+type ProductService struct{ repository Repository }
 
-func NewProductService(pool *pgxpool.Pool) *ProductService { return &ProductService{pool: pool} }
+func NewProductService(repository Repository) *ProductService {
+	return &ProductService{repository: repository}
+}
 
 func (s *ProductService) List(ctx context.Context) ([]inventory.ProductStock, error) {
-	return repositories.New(s.pool).ListProductStock(ctx)
+	return s.repository.ListProductStock(ctx)
 }

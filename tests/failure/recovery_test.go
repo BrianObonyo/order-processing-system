@@ -17,9 +17,10 @@ import (
 // A stuck order is cancelled and its reserved stock goes back on sale.
 func TestRecoveryCancelsStaleOrderAndReleasesStock(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
-	payments := services.NewPaymentService(pool, testutil.StubGateway{})
-	recovery := services.NewRecoveryService(pool, payments, 2*time.Minute, 30*time.Second, 3)
+	store := testutil.Store(pool)
+	orders := services.NewOrderService(store)
+	payments := services.NewPaymentService(store, testutil.StubGateway{})
+	recovery := services.NewRecoveryService(store, payments, 2*time.Minute, 30*time.Second, 3)
 	product := testutil.SeedProduct(t, pool, 5)
 
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-recover-1",
@@ -55,9 +56,10 @@ func TestRecoveryCancelsStaleOrderAndReleasesStock(t *testing.T) {
 // Idle orders get their event re-emitted, but only up to the retry budget.
 func TestRecoveryRetriesStalledOrdersWithinBudget(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
-	payments := services.NewPaymentService(pool, testutil.StubGateway{})
-	recovery := services.NewRecoveryService(pool, payments, time.Hour, 30*time.Second, 2)
+	store := testutil.Store(pool)
+	orders := services.NewOrderService(store)
+	payments := services.NewPaymentService(store, testutil.StubGateway{})
+	recovery := services.NewRecoveryService(store, payments, time.Hour, 30*time.Second, 2)
 	product := testutil.SeedProduct(t, pool, 5)
 
 	res, _ := orders.CreateOrder(context.Background(), "user-1", "key-retry-001",
@@ -80,10 +82,11 @@ func TestRecoveryRetriesStalledOrdersWithinBudget(t *testing.T) {
 
 func TestRecoveryWaitsForChargeReconciliationBeforeCancellation(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	store := testutil.Store(pool)
+	orders := services.NewOrderService(store)
 	gateway := &reconciliationGateway{chargeErr: payment.ErrTransient, lookupErr: payment.ErrTransient}
-	payments := services.NewPaymentService(pool, gateway)
-	recovery := services.NewRecoveryService(pool, payments, time.Minute, 30*time.Second, 3)
+	payments := services.NewPaymentService(store, gateway)
+	recovery := services.NewRecoveryService(store, payments, time.Minute, 30*time.Second, 3)
 	product := testutil.SeedProduct(t, pool, 2)
 
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-unknown-charge-1",
@@ -134,7 +137,7 @@ func TestRecoveryWaitsForChargeReconciliationBeforeCancellation(t *testing.T) {
 // stock is not deducted twice.
 func TestLatePaymentAfterCancellationIsRefunded(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 5)
 
 	res, _ := orders.CreateOrder(context.Background(), "user-1", "key-late-0001",
@@ -142,8 +145,9 @@ func TestLatePaymentAfterCancellationIsRefunded(t *testing.T) {
 
 	// The gateway call "takes a long time"; meanwhile recovery cancels the order.
 	slow := &cancelDuringCharge{}
-	payments := services.NewPaymentService(pool, slow)
-	slow.recovery = services.NewRecoveryService(pool, payments, 0, time.Hour, 0)
+	store := testutil.Store(pool)
+	payments := services.NewPaymentService(store, slow)
+	slow.recovery = services.NewRecoveryService(store, payments, 0, time.Hour, 0)
 	if err := payments.ProcessOrder(context.Background(), res.Order.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +177,7 @@ func TestLatePaymentAfterCancellationIsRefunded(t *testing.T) {
 
 func TestFailedLateRefundStaysPendingAndIsRequeued(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 2)
 	res, err := orders.CreateOrder(context.Background(), "user-1", "key-refund-retry-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
@@ -182,8 +186,9 @@ func TestFailedLateRefundStaysPendingAndIsRequeued(t *testing.T) {
 	}
 
 	gateway := &cancelDuringCharge{refundFailures: 1}
-	payments := services.NewPaymentService(pool, gateway)
-	recovery := services.NewRecoveryService(pool, payments, 0, time.Minute, 0)
+	store := testutil.Store(pool)
+	payments := services.NewPaymentService(store, gateway)
+	recovery := services.NewRecoveryService(store, payments, 0, time.Minute, 0)
 	gateway.recovery = recovery
 	if err := payments.ProcessOrder(context.Background(), res.Order.ID); !errors.Is(err, payment.ErrTransient) {
 		t.Fatalf("ProcessOrder err=%v, want transient refund error", err)

@@ -21,7 +21,10 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
+	"github.com/BrianObonyo/order-processing-system/internal/infrastructure/postgres"
 )
+
+func Store(pool *pgxpool.Pool) *postgres.Store { return postgres.NewStore(pool) }
 
 func StartPostgres(t *testing.T) *pgxpool.Pool {
 	t.Helper()

@@ -71,14 +71,15 @@ func run() error {
 	}()
 
 	// Modules.
-	orderSvc := services.NewOrderService(pool)
-	productSvc := services.NewProductService(pool)
+	store := postgres.NewStore(pool)
+	orderSvc := services.NewOrderService(store)
+	productSvc := services.NewProductService(store)
 	gateway := services.NewResilientGateway(
 		services.NewSimulatedGateway(cfg.PaymentFailureRate, cfg.PaymentTransientRate, cfg.PaymentLatency),
 		cfg.PaymentGatewayAttempts, 200*time.Millisecond,
 	)
-	paymentSvc := services.NewPaymentService(pool, gateway)
-	recoverySvc := services.NewRecoveryService(pool, paymentSvc, cfg.OrderPaymentTimeout, cfg.PaymentRetryAfter, cfg.PaymentMaxRecovery)
+	paymentSvc := services.NewPaymentService(store, gateway)
+	recoverySvc := services.NewRecoveryService(store, paymentSvc, cfg.OrderPaymentTimeout, cfg.PaymentRetryAfter, cfg.PaymentMaxRecovery)
 
 	// Background workers.
 	var wg sync.WaitGroup

@@ -15,7 +15,7 @@ import (
 
 func TestRetentionDeletesOnlyPublishedOutboxAndExpiredIdempotencyKeys(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	orders := services.NewOrderService(pool)
+	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 5)
 
 	published, err := orders.CreateOrder(context.Background(), "user-1", "retention-published-1",

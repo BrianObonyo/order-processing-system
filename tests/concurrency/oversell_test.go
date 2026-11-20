@@ -20,7 +20,7 @@ import (
 // 100 concurrent buyers compete for 10 units: exactly 10 may succeed.
 func TestNoOverselling(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	svc := services.NewOrderService(pool)
+	svc := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 10)
 
 	const buyers = 100
@@ -65,7 +65,7 @@ func TestNoOverselling(t *testing.T) {
 // Orders that list the same products in opposite order must not deadlock.
 func TestNoDeadlockOnMultiProductOrders(t *testing.T) {
 	pool := testutil.StartPostgres(t)
-	svc := services.NewOrderService(pool)
+	svc := services.NewOrderService(testutil.Store(pool))
 	a := testutil.SeedProduct(t, pool, 500)
 	b := testutil.SeedProduct(t, pool, 500)
 

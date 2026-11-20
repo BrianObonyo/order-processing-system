@@ -6,26 +6,45 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/metrics"
-	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 )
 
-type OrderService struct{ pool *pgxpool.Pool }
+type OrderService struct {
+	repository Repository
+	pricing    PricingPolicy
+	validator  OrderValidator
+}
 
-func NewOrderService(pool *pgxpool.Pool) *OrderService { return &OrderService{pool: pool} }
+func NewOrderService(repository Repository, options ...OrderOption) *OrderService {
+	service := &OrderService{repository: repository, pricing: CatalogPricing{}}
+	for _, option := range options {
+		option(service)
+	}
+	return service
+}
 
 type CreateOrderResult struct {
 	Order    *order.Order
 	Replayed bool // true when the response comes from an earlier identical request
 }
+
+type OrderPage struct {
+	Orders   []*order.Order `json:"orders"`
+	Page     int            `json:"page"`
+	PageSize int            `json:"page_size"`
+	Total    int64          `json:"total"`
+}
+
+var (
+	ErrInvalidPagination  = errors.New("invalid pagination")
+	ErrOrderNotCancelable = errors.New("order cannot be cancelled in its current state")
+)
 
 // CreateOrder runs everything in one transaction: claim the idempotency key,
 // reserve stock, insert the order and write the order.created outbox event.
@@ -43,9 +62,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 	orderID := uuid.NewString()
 
 	var result *CreateOrderResult
-	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		q := repositories.New(tx)
-
+	err = s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		claimed, err := q.ClaimIdempotencyKey(ctx, userID, idempotencyKey, hash, orderID)
 		if err != nil {
 			return err
@@ -65,6 +82,11 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 			result = &CreateOrderResult{Order: existing, Replayed: true}
 			return nil
 		}
+		if s.validator != nil {
+			if err := s.validator.ValidateOrder(ctx, userID, append([]order.CreateItem(nil), norm...)); err != nil {
+				return err
+			}
+		}
 
 		ids := make([]string, len(norm))
 		for i, it := range norm {
@@ -75,16 +97,22 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 			return err
 		}
 
+		priced, err := s.pricing.Price(ctx, OrderPricingRequest{
+			UserID: userID, Items: append([]order.CreateItem(nil), norm...), CatalogCents: clonePrices(prices),
+		})
+		if err != nil {
+			return err
+		}
+		if err := validatePricing(norm, priced); err != nil {
+			return err
+		}
+
 		o := &order.Order{
 			ID: orderID, UserID: userID, Status: order.StatusPendingPayment,
-			Items: make([]order.Item, 0, len(norm)),
+			Items: priced.Items, TotalCents: priced.TotalCents,
 		}
 		// norm is sorted by product ID, so stock rows are always locked in the same order.
 		for _, it := range norm {
-			price, ok := prices[it.ProductID]
-			if !ok {
-				return fmt.Errorf("%w: %s", inventory.ErrUnknownProduct, it.ProductID)
-			}
 			reserved, err := q.ReserveStock(ctx, it.ProductID, it.Quantity)
 			if err != nil {
 				return err
@@ -92,8 +120,6 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 			if !reserved {
 				return &inventory.InsufficientStockError{ProductID: it.ProductID, Requested: it.Quantity}
 			}
-			o.TotalCents += price * int64(it.Quantity)
-			o.Items = append(o.Items, order.Item{ProductID: it.ProductID, Quantity: it.Quantity, UnitPriceCents: price})
 		}
 
 		if err := q.InsertOrder(ctx, o); err != nil {
@@ -133,7 +159,7 @@ func (s *OrderService) GetOrder(ctx context.Context, userID, id string) (*order.
 	if _, err := uuid.Parse(id); err != nil {
 		return nil, order.ErrNotFound
 	}
-	o, err := repositories.New(s.pool).GetOrder(ctx, id)
+	o, err := s.repository.GetOrder(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +167,47 @@ func (s *OrderService) GetOrder(ctx context.Context, userID, id string) (*order.
 		return nil, order.ErrNotFound // do not reveal other users' orders
 	}
 	return o, nil
+}
+
+func (s *OrderService) ListOrders(ctx context.Context, userID string, page, pageSize int) (*OrderPage, error) {
+	if page < 1 || pageSize < 1 || pageSize > 100 || page-1 > int(^uint(0)>>1)/pageSize {
+		return nil, ErrInvalidPagination
+	}
+	offset := (page - 1) * pageSize
+	orders, total, err := s.repository.ListOrders(ctx, userID, pageSize, offset)
+	if err != nil {
+		return nil, err
+	}
+	if orders == nil {
+		orders = []*order.Order{}
+	}
+	return &OrderPage{Orders: orders, Page: page, PageSize: pageSize, Total: total}, nil
+}
+
+func (s *OrderService) CancelOrder(ctx context.Context, userID, id string) error {
+	if _, err := uuid.Parse(id); err != nil {
+		return order.ErrNotFound
+	}
+	return s.repository.WithinTransaction(ctx, func(tx Transaction) error {
+		o, err := tx.LockOrder(ctx, id)
+		if err != nil {
+			return err
+		}
+		if o.UserID != userID {
+			return order.ErrNotFound
+		}
+		if o.Status != order.StatusPendingPayment {
+			return ErrOrderNotCancelable
+		}
+		cancelled, err := cancelLockedPendingOrder(ctx, tx, o, "cancelled by customer")
+		if err != nil {
+			return err
+		}
+		if !cancelled {
+			return ErrOrderNotCancelable
+		}
+		return nil
+	})
 }
 
 func recordRejection(err error) {

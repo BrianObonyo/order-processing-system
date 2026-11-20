@@ -5,26 +5,22 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/metrics"
-	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 )
 
 // RecoveryService repairs orders that got stuck in PENDING_PAYMENT, for example
 // because a consumer crashed or the payment gateway was down for a while.
 type RecoveryService struct {
 	payments    *PaymentService
-	pool        *pgxpool.Pool
+	repository  Repository
 	expireAfter time.Duration
 	retryAfter  time.Duration
 	maxRetries  int
 }
 
-func NewRecoveryService(pool *pgxpool.Pool, payments *PaymentService, expireAfter, retryAfter time.Duration, maxRetries int) *RecoveryService {
-	return &RecoveryService{pool: pool, payments: payments, expireAfter: expireAfter, retryAfter: retryAfter, maxRetries: maxRetries}
+func NewRecoveryService(repository Repository, payments *PaymentService, expireAfter, retryAfter time.Duration, maxRetries int) *RecoveryService {
+	return &RecoveryService{repository: repository, payments: payments, expireAfter: expireAfter, retryAfter: retryAfter, maxRetries: maxRetries}
 }
 
 type SweepResult struct {
@@ -42,9 +38,7 @@ type SweepResult struct {
 // concurrently with payment processing and on several instances at once.
 func (s *RecoveryService) Sweep(ctx context.Context) (SweepResult, error) {
 	var res SweepResult
-	q := repositories.New(s.pool)
-
-	expired, err := q.ListExpiredOrders(ctx, time.Now().Add(-s.expireAfter), 100)
+	expired, err := s.repository.ListExpiredOrders(ctx, time.Now().Add(-s.expireAfter), 100)
 	if err != nil {
 		return res, err
 	}
@@ -69,14 +63,13 @@ func (s *RecoveryService) Sweep(ctx context.Context) (SweepResult, error) {
 		return res, err
 	}
 
-	stalled, err := q.ListStalledOrders(ctx, time.Now().Add(-s.retryAfter), s.maxRetries, 100)
+	stalled, err := s.repository.ListStalledOrders(ctx, time.Now().Add(-s.retryAfter), s.maxRetries, 100)
 	if err != nil {
 		return res, err
 	}
 	for _, id := range stalled {
 		retried := false
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			tq := repositories.New(tx)
+		err := s.repository.WithinTransaction(ctx, func(tq Transaction) error {
 			o, err := tq.LockOrder(ctx, id)
 			if err != nil || o.Status != order.StatusPendingPayment {
 				return err

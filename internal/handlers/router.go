@@ -10,12 +10,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/BrianObonyo/order-processing-system/internal/middleware"
-	"github.com/BrianObonyo/order-processing-system/internal/services"
 )
 
 type Deps struct {
-	Orders              *services.OrderService
-	Products            *services.ProductService
+	Orders              OrderAPI
+	Products            ProductAPI
 	APIKeys             map[string]string
 	MetricsToken        string
 	Locker              middleware.Locker // may be nil
@@ -73,6 +72,8 @@ func NewRouter(d Deps) *gin.Engine {
 		maxBodyBytes = 1 << 20
 	}
 	v1.POST("/orders", middleware.MaxRequestBodyBytes(maxBodyBytes), middleware.Idempotency(d.Locker), orders.Create)
+	v1.GET("/orders", orders.List)
+	v1.POST("/orders/:id/cancel", orders.Cancel)
 	v1.GET("/orders/:id", orders.Get)
 	return r
 }

@@ -63,6 +63,44 @@ func (q *Queries) GetOrder(ctx context.Context, id string) (*order.Order, error)
 	return o, err
 }
 
+// ListOrders returns one user's orders, newest first, with a stable tie-breaker.
+func (q *Queries) ListOrders(ctx context.Context, userID string, limit, offset int) ([]*order.Order, int64, error) {
+	var total int64
+	if err := q.db.QueryRow(ctx, `SELECT count(*) FROM orders WHERE user_id = $1`, userID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	rows, err := q.db.Query(ctx, selectOrder+`
+		WHERE user_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2 OFFSET $3`, userID, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	var result []*order.Order
+	for rows.Next() {
+		o, err := scanOrder(rows)
+		if err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		result = append(result, o)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, 0, err
+	}
+	rows.Close()
+
+	for _, o := range result {
+		o.Items, err = q.GetOrderItems(ctx, o.ID)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return result, total, nil
+}
+
 // LockOrder takes a row lock; every lifecycle transition starts here so that
 // payment completion and recovery cancellation serialise on the same row.
 func (q *Queries) LockOrder(ctx context.Context, id string) (*order.Order, error) {
