@@ -61,6 +61,7 @@ services:
       REDIS_ADDR: redis:6379
       KAFKA_BROKERS: kafka:9092
       API_KEYS: dev-key-1:user-1,dev-key-2:user-2
+      PAYMENT_GATEWAY_PROVIDER: simulated
     depends_on:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }

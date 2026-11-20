@@ -18,6 +18,8 @@ const (
 
 type ChargeStatus string
 
+const ProviderSimulated = "simulated"
+
 const (
 	ChargeStatusNotFound  ChargeStatus = "NOT_FOUND"
 	ChargeStatusPending   ChargeStatus = "PENDING"

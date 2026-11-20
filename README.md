@@ -68,6 +68,8 @@ Every Kafka message uses an envelope containing an event ID, type, schema versio
 
 Payment and refund processing is attempted once per delivery; transient failures are retried by the database-backed recovery worker instead of sleeping and retrying inside a Kafka partition. `PAYMENT_CONSUMER_WORKERS` controls the number of group members (default 3); effective concurrency is limited by `KAFKA_PARTITIONS` (default 3). Existing Kafka topics are not resized automatically; coordinate partition increases with Kafka administration because changing a keyed topic's partition count can change key-to-partition assignments. `PAYMENT_GATEWAY_MAX_ATTEMPTS` defaults to 1 to avoid multiplying gateway retries by recovery retries.
 
+`PAYMENT_GATEWAY_PROVIDER` selects the registered payment adapter. Development defaults to `simulated`; production must explicitly select a non-simulated provider. The registry currently includes only the simulated development adapter, so a production provider must be implemented and registered before production startup. Provider adapters must support idempotent charge/refund operations and charge lookup; gateway contract tests in `internal/services/gateway_registry_test.go` define those expectations.
+
 ## Operations and security
 
 - `APP_ENV` defaults to `production`. Startup always requires explicit `DATABASE_URL` and `API_KEYS`; there are no source-code defaults for database credentials or API keys. Production additionally requires explicit `REDIS_ADDR`, `KAFKA_BROKERS`, and `METRICS_TOKEN`, rejects the sample database credentials, and requires API keys and the metrics token to each be at least 32 characters. The checked-in `.env.example` and Compose settings are for local development only.

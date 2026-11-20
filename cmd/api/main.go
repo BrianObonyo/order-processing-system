@@ -74,10 +74,13 @@ func run() error {
 	store := postgres.NewStore(pool)
 	orderSvc := services.NewOrderService(store)
 	productSvc := services.NewProductService(store)
-	gateway := services.NewResilientGateway(
-		services.NewSimulatedGateway(cfg.PaymentFailureRate, cfg.PaymentTransientRate, cfg.PaymentLatency),
-		cfg.PaymentGatewayAttempts, 200*time.Millisecond,
-	)
+	gatewayAdapter, err := services.NewGatewayRegistry().Build(cfg.PaymentGatewayProvider, services.GatewaySettings{
+		DeclineRate: cfg.PaymentFailureRate, TransientRate: cfg.PaymentTransientRate, Latency: cfg.PaymentLatency,
+	})
+	if err != nil {
+		return err
+	}
+	gateway := services.NewResilientGateway(gatewayAdapter, cfg.PaymentGatewayAttempts, 200*time.Millisecond)
 	paymentSvc := services.NewPaymentService(store, gateway)
 	recoverySvc := services.NewRecoveryService(store, paymentSvc, cfg.OrderPaymentTimeout, cfg.PaymentRetryAfter, cfg.PaymentMaxRecovery)
 

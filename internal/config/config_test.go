@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -18,6 +20,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 	if cfg.PaymentConsumerWorkers != 3 || cfg.PaymentGatewayAttempts != 1 ||
+		cfg.PaymentGatewayProvider != payment.ProviderSimulated ||
 		cfg.KafkaPartitions != 3 || cfg.KafkaDLQTopic != "order-events.dead-letter" {
 		t.Fatalf("unexpected event-processing defaults: %+v", cfg)
 	}
@@ -62,6 +65,26 @@ func TestLoadRejectsWeakProductionCredentials(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "32 characters") {
 		t.Fatalf("Load() error = %v, want weak production API key rejection", err)
+	}
+}
+
+func TestLoadRequiresProductionGatewayProvider(t *testing.T) {
+	setProductionConfigEnv(t)
+	t.Setenv("PAYMENT_GATEWAY_PROVIDER", "")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "PAYMENT_GATEWAY_PROVIDER") {
+		t.Fatalf("Load() error=%v, want production gateway provider required", err)
+	}
+}
+
+func TestLoadRejectsSimulatedGatewayInProduction(t *testing.T) {
+	setProductionConfigEnv(t)
+	t.Setenv("PAYMENT_GATEWAY_PROVIDER", payment.ProviderSimulated)
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "not allowed in production") {
+		t.Fatalf("Load() error=%v, want simulated gateway rejected in production", err)
 	}
 }
 
@@ -172,6 +195,7 @@ func setDefaultConfigEnv(t *testing.T) {
 		"PAYMENT_MAX_RECOVERY",
 		"PAYMENT_CONSUMER_WORKERS",
 		"PAYMENT_GATEWAY_MAX_ATTEMPTS",
+		"PAYMENT_GATEWAY_PROVIDER",
 		"KAFKA_PARTITIONS",
 		"KAFKA_BROKERS",
 		"KAFKA_TOPIC",
@@ -193,4 +217,5 @@ func setProductionConfigEnv(t *testing.T) {
 	t.Setenv("KAFKA_BROKERS", "kafka:9092")
 	t.Setenv("API_KEYS", strings.Repeat("a", 32)+":service-user")
 	t.Setenv("METRICS_TOKEN", strings.Repeat("m", 32))
+	t.Setenv("PAYMENT_GATEWAY_PROVIDER", "provider-test")
 }

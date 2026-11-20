@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 )
 
 type Config struct {
@@ -31,6 +33,7 @@ type Config struct {
 
 	PaymentConsumerWorkers int
 	PaymentGatewayAttempts int
+	PaymentGatewayProvider string
 	HTTPRateLimit          float64
 	HTTPRateBurst          int
 	HTTPMaxBodyBytes       int64
@@ -121,6 +124,13 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	paymentGatewayProvider := strings.ToLower(strings.TrimSpace(os.Getenv("PAYMENT_GATEWAY_PROVIDER")))
+	if paymentGatewayProvider == "" {
+		if appEnv != "development" {
+			return nil, fmt.Errorf("PAYMENT_GATEWAY_PROVIDER is required when APP_ENV=production")
+		}
+		paymentGatewayProvider = payment.ProviderSimulated
+	}
 	kafkaPartitions, err := envInt("KAFKA_PARTITIONS", 3)
 	if err != nil {
 		return nil, err
@@ -169,6 +179,7 @@ func Load() (*Config, error) {
 		RunWorkers:             runWorkers,
 		PaymentConsumerWorkers: paymentConsumerWorkers,
 		PaymentGatewayAttempts: paymentGatewayAttempts,
+		PaymentGatewayProvider: paymentGatewayProvider,
 		HTTPRateLimit:          httpRateLimit,
 		HTTPRateBurst:          httpRateBurst,
 		HTTPMaxBodyBytes:       int64(httpMaxBodyBytes),
@@ -252,6 +263,9 @@ func (c *Config) validate() error {
 	if c.PaymentGatewayAttempts < 1 {
 		return fmt.Errorf("PAYMENT_GATEWAY_MAX_ATTEMPTS must be at least 1")
 	}
+	if c.PaymentGatewayProvider == "" {
+		return fmt.Errorf("PAYMENT_GATEWAY_PROVIDER must not be empty")
+	}
 	if c.KafkaPartitions < 1 {
 		return fmt.Errorf("KAFKA_PARTITIONS must be at least 1")
 	}
@@ -286,6 +300,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("RETENTION_BATCH_SIZE must be at least 1")
 	}
 	if c.AppEnv == "production" {
+		if c.PaymentGatewayProvider == payment.ProviderSimulated {
+			return fmt.Errorf("PAYMENT_GATEWAY_PROVIDER=simulated is not allowed in production")
+		}
 		databaseURL, err := url.Parse(c.DatabaseURL)
 		if err != nil || (databaseURL.Scheme != "postgres" && databaseURL.Scheme != "postgresql") || databaseURL.Host == "" {
 			return fmt.Errorf("DATABASE_URL is invalid")
