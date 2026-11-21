@@ -7,8 +7,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
+	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/middleware"
 	"github.com/BrianObonyo/order-processing-system/internal/services"
 )
@@ -38,6 +40,10 @@ func handleServiceError(c *gin.Context, err error) {
 		respondError(c, http.StatusConflict, "order_not_cancelable", "order cannot be cancelled in its current state")
 	case errors.Is(err, services.ErrInvalidPagination):
 		respondError(c, http.StatusBadRequest, "invalid_pagination", "pagination values are out of range")
+	case errors.Is(err, payment.ErrNoRetryableAttempt):
+		respondError(c, http.StatusConflict, "payment_not_retryable", "order has no declined payment attempt to retry")
+	case errors.Is(err, identity.ErrForbidden):
+		respondError(c, http.StatusForbidden, "forbidden", "this API key does not have permission for this operation")
 	default:
 		slog.Error("unhandled error", "request_id", middleware.RequestIDValue(c), "path", c.FullPath(), "err", err)
 		respondError(c, http.StatusInternalServerError, "internal_error", "something went wrong")

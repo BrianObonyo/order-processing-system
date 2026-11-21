@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/metrics"
@@ -45,12 +46,12 @@ func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error
 		if o.Status != order.StatusPendingPayment {
 			return errSkip
 		}
-		pay, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		pay, err = q.GetLatestPaymentAttemptByOrder(ctx, o.TenantID, orderID)
 		if errors.Is(err, payment.ErrNotFound) {
-			if err := q.InsertPaymentAttempt(ctx, uuid.NewString(), orderID, o.TotalCents); err != nil {
+			if err := q.InsertPaymentAttempt(ctx, uuid.NewString(), o.TenantID, orderID, o.TotalCents); err != nil {
 				return err
 			}
-			pay, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+			pay, err = q.GetLatestPaymentAttemptByOrder(ctx, o.TenantID, orderID)
 		}
 		return err
 	})
@@ -78,17 +79,26 @@ func (s *PaymentService) ProcessOrder(ctx context.Context, orderID string) error
 
 // RetryPayment starts a new attempt after a permanent decline. The order stays
 // pending, and the previous attempt remains available for audit.
-func (s *PaymentService) RetryPayment(ctx context.Context, orderID string) (*payment.Payment, error) {
+func (s *PaymentService) RetryPayment(ctx context.Context, actor identity.Identity, orderID string) (*payment.Payment, error) {
+	if !actor.IsValid() {
+		return nil, identity.ErrInvalid
+	}
+	if actor.Role != identity.RoleAdmin {
+		return nil, identity.ErrForbidden
+	}
 	var attempt *payment.Payment
 	err := s.repository.WithinTransaction(ctx, func(q Transaction) error {
 		o, err := q.LockOrder(ctx, orderID)
 		if err != nil {
 			return err
 		}
+		if o.TenantID != actor.TenantID {
+			return order.ErrNotFound
+		}
 		if o.Status != order.StatusPendingPayment {
 			return payment.ErrNoRetryableAttempt
 		}
-		previous, err := q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		previous, err := q.GetLatestPaymentAttemptByOrder(ctx, actor.TenantID, orderID)
 		if errors.Is(err, payment.ErrNotFound) {
 			return payment.ErrNoRetryableAttempt
 		}
@@ -98,15 +108,15 @@ func (s *PaymentService) RetryPayment(ctx context.Context, orderID string) (*pay
 		if previous.Status != payment.StatusFailed {
 			return payment.ErrNoRetryableAttempt
 		}
-		if err := q.InsertPaymentAttempt(ctx, uuid.NewString(), orderID, o.TotalCents); err != nil {
+		if err := q.InsertPaymentAttempt(ctx, uuid.NewString(), actor.TenantID, orderID, o.TotalCents); err != nil {
 			return err
 		}
-		attempt, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		attempt, err = q.GetLatestPaymentAttemptByOrder(ctx, actor.TenantID, orderID)
 		if err != nil {
 			return err
 		}
 		return q.InsertOutbox(ctx, orderID, order.EventCreated, order.Event{
-			OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents,
+			OrderID: orderID, TenantID: o.TenantID, UserID: o.UserID, TotalCents: o.TotalCents,
 		})
 	})
 	if err != nil {
@@ -160,7 +170,7 @@ func (s *PaymentService) finalizeSuccess(ctx context.Context, orderID, paymentID
 			return fmt.Errorf("payment %s changed state while scheduling refund", paymentID)
 		}
 		return q.InsertOutbox(ctx, orderID, order.EventPaymentRefundRequested, order.Event{
-			OrderID: orderID, PaymentID: paymentID, TotalCents: pay.AmountCents,
+			OrderID: orderID, TenantID: o.TenantID, PaymentID: paymentID, TotalCents: pay.AmountCents,
 			Reason: "order no longer pending",
 		})
 	})
@@ -201,7 +211,7 @@ func (s *PaymentService) ProcessRefund(ctx context.Context, paymentID string) er
 			return err
 		}
 		return q.InsertOutbox(ctx, pay.OrderID, order.EventPaymentRefunded, order.Event{
-			OrderID: pay.OrderID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
+			OrderID: pay.OrderID, TenantID: pay.TenantID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
 			Reason: "order no longer pending",
 		})
 	})
@@ -230,7 +240,7 @@ func (s *PaymentService) ReconcileExpiredOrder(ctx context.Context, orderID stri
 			return nil
 		}
 
-		pay, err = q.GetLatestPaymentAttemptByOrder(ctx, orderID)
+		pay, err = q.GetLatestPaymentAttemptByOrder(ctx, o.TenantID, orderID)
 		if errors.Is(err, payment.ErrNotFound) {
 			cancelled, cancelErr := cancelPendingOrder(ctx, q, orderID, "payment timed out")
 			if cancelled {
@@ -323,7 +333,7 @@ func (s *PaymentService) RequeuePendingRefunds(ctx context.Context, retryAfter t
 				return err
 			}
 			if err := tq.InsertOutbox(ctx, pay.OrderID, order.EventPaymentRefundRequested, order.Event{
-				OrderID: pay.OrderID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
+				OrderID: pay.OrderID, TenantID: pay.TenantID, PaymentID: pay.ID, TotalCents: pay.AmountCents,
 				Reason: pay.FailureReason,
 			}); err != nil {
 				return err

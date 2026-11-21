@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
@@ -18,6 +20,24 @@ type Store struct{ pool *pgxpool.Pool }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
+func ValidateTenants(ctx context.Context, pool *pgxpool.Pool, keys map[string]identity.Identity) error {
+	seen := make(map[string]struct{}, len(keys))
+	for _, id := range keys {
+		if _, ok := seen[id.TenantID]; ok {
+			continue
+		}
+		var exists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)`, id.TenantID).Scan(&exists); err != nil {
+			return fmt.Errorf("validate configured tenant: %w", err)
+		}
+		if !exists {
+			return fmt.Errorf("API key references unconfigured tenant %q", id.TenantID)
+		}
+		seen[id.TenantID] = struct{}{}
+	}
+	return nil
+}
+
 func (s *Store) WithinTransaction(ctx context.Context, fn func(services.Transaction) error) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		return fn(repositories.New(tx))
@@ -28,12 +48,16 @@ func (s *Store) GetOrder(ctx context.Context, id string) (*order.Order, error) {
 	return repositories.New(s.pool).GetOrder(ctx, id)
 }
 
-func (s *Store) ListOrders(ctx context.Context, userID string, limit, offset int) ([]*order.Order, int64, error) {
-	return repositories.New(s.pool).ListOrders(ctx, userID, limit, offset)
+func (s *Store) GetOrderForTenant(ctx context.Context, tenantID, id string) (*order.Order, error) {
+	return repositories.New(s.pool).GetOrderForTenant(ctx, tenantID, id)
 }
 
-func (s *Store) ListProductStock(ctx context.Context) ([]inventory.ProductStock, error) {
-	return repositories.New(s.pool).ListProductStock(ctx)
+func (s *Store) ListOrders(ctx context.Context, tenantID, userID string, limit, offset int) ([]*order.Order, int64, error) {
+	return repositories.New(s.pool).ListOrders(ctx, tenantID, userID, limit, offset)
+}
+
+func (s *Store) ListProductStock(ctx context.Context, tenantID string) ([]inventory.ProductStock, error) {
+	return repositories.New(s.pool).ListProductStock(ctx, tenantID)
 }
 
 func (s *Store) GetPaymentByID(ctx context.Context, id string) (*payment.Payment, error) {

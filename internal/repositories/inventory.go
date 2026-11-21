@@ -9,11 +9,11 @@ import (
 // anti-overselling mechanism: the row is locked by the UPDATE, and the
 // availability check and the increment happen as one statement, so two
 // concurrent orders can never both claim the last unit.
-func (q *Queries) ReserveStock(ctx context.Context, productID string, qty int) (bool, error) {
+func (q *Queries) ReserveStock(ctx context.Context, tenantID, productID string, qty int) (bool, error) {
 	tag, err := q.db.Exec(ctx, `
 		UPDATE inventory
-		SET reserved = reserved + $2, updated_at = now()
-		WHERE product_id = $1 AND on_hand - reserved >= $2`, productID, qty)
+		SET reserved = reserved + $3, updated_at = now()
+		WHERE tenant_id = $1 AND product_id = $2 AND on_hand - reserved >= $3`, tenantID, productID, qty)
 	if err != nil {
 		return false, err
 	}
@@ -21,11 +21,11 @@ func (q *Queries) ReserveStock(ctx context.Context, productID string, qty int) (
 }
 
 // ReleaseStock returns a reservation to the available pool (cancellation).
-func (q *Queries) ReleaseStock(ctx context.Context, productID string, qty int) error {
+func (q *Queries) ReleaseStock(ctx context.Context, tenantID, productID string, qty int) error {
 	tag, err := q.db.Exec(ctx, `
 		UPDATE inventory
-		SET reserved = reserved - $2, updated_at = now()
-		WHERE product_id = $1`, productID, qty)
+		SET reserved = reserved - $3, updated_at = now()
+		WHERE tenant_id = $1 AND product_id = $2`, tenantID, productID, qty)
 	if err != nil {
 		return err
 	}
@@ -36,11 +36,11 @@ func (q *Queries) ReleaseStock(ctx context.Context, productID string, qty int) e
 }
 
 // CommitStock turns a reservation into a real stock deduction (payment succeeded).
-func (q *Queries) CommitStock(ctx context.Context, productID string, qty int) error {
+func (q *Queries) CommitStock(ctx context.Context, tenantID, productID string, qty int) error {
 	tag, err := q.db.Exec(ctx, `
 		UPDATE inventory
-		SET on_hand = on_hand - $2, reserved = reserved - $2, updated_at = now()
-		WHERE product_id = $1`, productID, qty)
+		SET on_hand = on_hand - $3, reserved = reserved - $3, updated_at = now()
+		WHERE tenant_id = $1 AND product_id = $2`, tenantID, productID, qty)
 	if err != nil {
 		return err
 	}

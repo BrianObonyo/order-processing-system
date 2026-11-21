@@ -20,6 +20,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/infrastructure/postgres"
 )
@@ -78,19 +79,39 @@ func StartPostgres(t *testing.T) *pgxpool.Pool {
 
 // SeedProduct inserts a product with the given stock and returns its ID.
 func SeedProduct(t *testing.T, pool *pgxpool.Pool, stock int) string {
+	return SeedProductForTenant(t, pool, "default", stock)
+}
+
+func SeedProductForTenant(t *testing.T, pool *pgxpool.Pool, tenantID string, stock int) string {
 	t.Helper()
 	id := uuid.NewString()
 	ctx := context.Background()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO products (id, sku, name, price_cents) VALUES ($1, $2, 'test product', 1000)`,
-		id, "SKU-"+id); err != nil {
+		`INSERT INTO products (id, tenant_id, sku, name, price_cents) VALUES ($1, $2, $3, 'test product', 1000)`,
+		id, tenantID, "SKU-"+id); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO inventory (product_id, on_hand) VALUES ($1, $2)`, id, stock); err != nil {
+		`INSERT INTO inventory (tenant_id, product_id, on_hand) VALUES ($1, $2, $3)`, tenantID, id, stock); err != nil {
 		t.Fatal(err)
 	}
 	return id
+}
+
+func SeedTenant(t *testing.T, pool *pgxpool.Pool, tenantID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO tenants (id, name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, tenantID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func UserIdentity(userID string) identity.Identity {
+	return identity.Identity{TenantID: "default", UserID: userID, Role: identity.RoleUser}
+}
+
+func AdminIdentity(tenantID, userID string) identity.Identity {
+	return identity.Identity{TenantID: tenantID, UserID: userID, Role: identity.RoleAdmin}
 }
 
 func Stock(t *testing.T, pool *pgxpool.Pool, productID string) (onHand, reserved int) {

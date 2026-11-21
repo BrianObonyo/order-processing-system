@@ -24,15 +24,15 @@ func (q *Queries) DeletePublishedOutboxBefore(ctx context.Context, cutoff time.T
 func (q *Queries) DeleteIdempotencyKeysBefore(ctx context.Context, cutoff time.Time, limit int) (int64, error) {
 	tag, err := q.db.Exec(ctx, `
 		WITH expired AS (
-			SELECT user_id, key FROM idempotency_keys
+			SELECT tenant_id, user_id, key FROM idempotency_keys
 			WHERE created_at < $1
-			ORDER BY created_at, user_id, key
+			ORDER BY created_at, tenant_id, user_id, key
 			LIMIT $2
 			FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM idempotency_keys k
 		USING expired e
-		WHERE k.user_id = e.user_id AND k.key = e.key`, cutoff, limit)
+		WHERE k.tenant_id = e.tenant_id AND k.user_id = e.user_id AND k.key = e.key`, cutoff, limit)
 	if err != nil {
 		return 0, err
 	}

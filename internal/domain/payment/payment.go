@@ -39,6 +39,7 @@ var (
 type Payment struct {
 	ID            string
 	OrderID       string
+	TenantID      string
 	AttemptNumber int
 	AmountCents   int64
 	Status        Status

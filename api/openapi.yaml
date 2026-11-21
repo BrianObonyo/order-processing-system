@@ -9,14 +9,14 @@ security:
 paths:
   /api/v1/products:
     get:
-      summary: List products with live availability
+      summary: List this tenant's products with live availability
       responses:
         "200":
           description: OK
   /api/v1/orders:
     get:
-      summary: List the authenticated user's orders
-      description: Returns a page of orders belonging to the API key's user, newest first.
+      summary: List tenant-scoped orders
+      description: Regular users see their own orders; tenant admins see all orders for their tenant.
       parameters:
         - in: query
           name: page
@@ -77,6 +77,53 @@ paths:
         "204": { description: Order cancelled }
         "404": { description: Not found }
         "409": { description: Order is no longer pending and cannot be cancelled }
+  /api/v1/admin/orders:
+    get:
+      summary: List all orders for the authenticated tenant
+      description: Requires an API key configured with the admin role.
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: page_size
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200": { description: Tenant order page, content: { application/json: { schema: { $ref: "#/components/schemas/OrderPage" } } } }
+        "403": { description: Admin role required }
+        "400": { description: Invalid pagination values }
+  /api/v1/admin/orders/{id}:
+    get:
+      summary: Get an order within the authenticated tenant
+      description: Requires an API key configured with the admin role.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Order details, content: { application/json: { schema: { $ref: "#/components/schemas/Order" } } } }
+        "403": { description: Admin role required }
+        "404": { description: Not found in this tenant }
+  /api/v1/admin/orders/{id}/cancel:
+    post:
+      summary: Cancel a pending order in the authenticated tenant
+      description: Requires an API key configured with the admin role.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: Order cancelled }
+        "403": { description: Admin role required }
+        "404": { description: Not found in this tenant }
+        "409": { description: Order is no longer pending }
+  /api/v1/admin/orders/{id}/retry-payment:
+    post:
+      summary: Retry a declined payment attempt
+      description: Requires an API key configured with the admin role. Only pending orders whose latest payment attempt was declined can be retried.
+      parameters:
+        - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "202": { description: Retry attempt queued }
+        "403": { description: Admin role required }
+        "404": { description: Order not found in this tenant }
+        "409": { description: No declined payment attempt can be retried }
 components:
   securitySchemes:
     apiKey: { type: apiKey, in: header, name: X-API-Key }
@@ -95,6 +142,7 @@ components:
       type: object
       properties:
         id: { type: string, format: uuid }
+        tenant_id: { type: string }
         user_id: { type: string }
         status: { type: string, enum: [PENDING_PAYMENT, PAID, CANCELLED] }
         total_cents: { type: integer, format: int64 }

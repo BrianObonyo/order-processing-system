@@ -9,13 +9,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/middleware"
 )
 
 type Deps struct {
 	Orders              OrderAPI
 	Products            ProductAPI
-	APIKeys             map[string]string
+	Payments            PaymentAPI
+	APIKeys             map[string]identity.Identity
 	MetricsToken        string
 	Locker              middleware.Locker // may be nil
 	MaxRequestBodyBytes int64
@@ -75,6 +77,13 @@ func NewRouter(d Deps) *gin.Engine {
 	v1.GET("/orders", orders.List)
 	v1.POST("/orders/:id/cancel", orders.Cancel)
 	v1.GET("/orders/:id", orders.Get)
+	admin := v1.Group("/admin", middleware.RequireRole(identity.RoleAdmin))
+	admin.GET("/orders", orders.List)
+	admin.GET("/orders/:id", orders.Get)
+	admin.POST("/orders/:id/cancel", orders.Cancel)
+	if d.Payments != nil {
+		admin.POST("/orders/:id/retry-payment", func(c *gin.Context) { orders.RetryPayment(c, d.Payments) })
+	}
 	return r
 }
 

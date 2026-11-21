@@ -23,7 +23,7 @@ func TestRecoveryCancelsStaleOrderAndReleasesStock(t *testing.T) {
 	recovery := services.NewRecoveryService(store, payments, 2*time.Minute, 30*time.Second, 3)
 	product := testutil.SeedProduct(t, pool, 5)
 
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-recover-1",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-recover-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 5}})
 	if err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestRecoveryCancelsStaleOrderAndReleasesStock(t *testing.T) {
 	if err != nil || sweep.Cancelled != 1 {
 		t.Fatalf("sweep=%+v err=%v, want 1 cancelled", sweep, err)
 	}
-	got, _ := orders.GetOrder(context.Background(), "user-1", res.Order.ID)
+	got, _ := orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID)
 	if got.Status != order.StatusCancelled {
 		t.Fatalf("status=%s, want CANCELLED", got.Status)
 	}
@@ -62,7 +62,7 @@ func TestRecoveryRetriesStalledOrdersWithinBudget(t *testing.T) {
 	recovery := services.NewRecoveryService(store, payments, time.Hour, 30*time.Second, 2)
 	product := testutil.SeedProduct(t, pool, 5)
 
-	res, _ := orders.CreateOrder(context.Background(), "user-1", "key-retry-001",
+	res, _ := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-retry-001",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
 
 	for i := 0; i < 4; i++ {
@@ -89,7 +89,7 @@ func TestRecoveryWaitsForChargeReconciliationBeforeCancellation(t *testing.T) {
 	recovery := services.NewRecoveryService(store, payments, time.Minute, 30*time.Second, 3)
 	product := testutil.SeedProduct(t, pool, 2)
 
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-unknown-charge-1",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-unknown-charge-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +105,7 @@ func TestRecoveryWaitsForChargeReconciliationBeforeCancellation(t *testing.T) {
 	if _, err := recovery.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, err := orders.GetOrder(context.Background(), "user-1", res.Order.ID)
+	got, err := orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestRecoveryWaitsForChargeReconciliationBeforeCancellation(t *testing.T) {
 	if _, err := recovery.Sweep(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	got, err = orders.GetOrder(context.Background(), "user-1", res.Order.ID)
+	got, err = orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestLatePaymentAfterCancellationIsRefunded(t *testing.T) {
 	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 5)
 
-	res, _ := orders.CreateOrder(context.Background(), "user-1", "key-late-0001",
+	res, _ := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-late-0001",
 		[]order.CreateItem{{ProductID: product, Quantity: 2}})
 
 	// The gateway call "takes a long time"; meanwhile recovery cancels the order.
@@ -152,7 +152,7 @@ func TestLatePaymentAfterCancellationIsRefunded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _ := orders.GetOrder(context.Background(), "user-1", res.Order.ID)
+	got, _ := orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID)
 	if got.Status != order.StatusCancelled {
 		t.Fatalf("status=%s, want CANCELLED", got.Status)
 	}
@@ -179,7 +179,7 @@ func TestFailedLateRefundStaysPendingAndIsRequeued(t *testing.T) {
 	pool := testutil.StartPostgres(t)
 	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 2)
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-refund-retry-1",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-refund-retry-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
 	if err != nil {
 		t.Fatal(err)

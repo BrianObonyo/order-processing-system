@@ -33,7 +33,7 @@ func TestNoOverselling(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := svc.CreateOrder(context.Background(), "user-1", uuid.NewString(),
+			_, err := svc.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), uuid.NewString(),
 				[]order.CreateItem{{ProductID: product, Quantity: 1}})
 			var stock *inventory.InsufficientStockError
 			switch {
@@ -78,7 +78,7 @@ func TestNoDeadlockOnMultiProductOrders(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := svc.CreateOrder(context.Background(), "user-1", uuid.NewString(), items); err != nil {
+			if _, err := svc.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), uuid.NewString(), items); err != nil {
 				t.Errorf("create order: %v", err)
 			}
 		}()

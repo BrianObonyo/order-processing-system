@@ -6,11 +6,12 @@ import (
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 )
 
-func (q *Queries) ListProductStock(ctx context.Context) ([]inventory.ProductStock, error) {
+func (q *Queries) ListProductStock(ctx context.Context, tenantID string) ([]inventory.ProductStock, error) {
 	rows, err := q.db.Query(ctx, `
 		SELECT p.id::text, p.sku, p.name, p.price_cents, i.on_hand, i.reserved
-		FROM products p JOIN inventory i ON i.product_id = p.id
-		ORDER BY p.sku`)
+		FROM products p JOIN inventory i ON i.tenant_id = p.tenant_id AND i.product_id = p.id
+		WHERE p.tenant_id = $1
+		ORDER BY p.sku`, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -28,9 +29,9 @@ func (q *Queries) ListProductStock(ctx context.Context) ([]inventory.ProductStoc
 	return out, rows.Err()
 }
 
-func (q *Queries) GetProductPrices(ctx context.Context, ids []string) (map[string]int64, error) {
+func (q *Queries) GetProductPrices(ctx context.Context, tenantID string, ids []string) (map[string]int64, error) {
 	rows, err := q.db.Query(ctx,
-		`SELECT id::text, price_cents FROM products WHERE id = ANY($1::text[]::uuid[])`, ids)
+		`SELECT id::text, price_cents FROM products WHERE tenant_id = $1 AND id = ANY($2::text[]::uuid[])`, tenantID, ids)
 	if err != nil {
 		return nil, err
 	}

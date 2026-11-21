@@ -31,7 +31,7 @@ func cancelLockedPendingOrder(ctx context.Context, q Transaction, o *order.Order
 		return false, err
 	}
 	for _, it := range items {
-		if err := q.ReleaseStock(ctx, it.ProductID, it.Quantity); err != nil {
+		if err := q.ReleaseStock(ctx, o.TenantID, it.ProductID, it.Quantity); err != nil {
 			return false, err
 		}
 	}
@@ -43,7 +43,7 @@ func cancelLockedPendingOrder(ctx context.Context, q Transaction, o *order.Order
 		return false, err
 	}
 	err = q.InsertOutbox(ctx, o.ID, order.EventCancelled, order.Event{
-		OrderID: o.ID, UserID: o.UserID, TotalCents: o.TotalCents, Reason: reason,
+		OrderID: o.ID, TenantID: o.TenantID, UserID: o.UserID, TotalCents: o.TotalCents, Reason: reason,
 	})
 	return err == nil, err
 }
@@ -63,7 +63,7 @@ func markOrderPaid(ctx context.Context, q Transaction, orderID string) (bool, er
 		return false, err
 	}
 	for _, it := range items {
-		if err := q.CommitStock(ctx, it.ProductID, it.Quantity); err != nil {
+		if err := q.CommitStock(ctx, o.TenantID, it.ProductID, it.Quantity); err != nil {
 			return false, err
 		}
 	}
@@ -72,7 +72,7 @@ func markOrderPaid(ctx context.Context, q Transaction, orderID string) (bool, er
 		return false, err
 	}
 	err = q.InsertOutbox(ctx, orderID, order.EventPaid, order.Event{
-		OrderID: orderID, UserID: o.UserID, TotalCents: o.TotalCents,
+		OrderID: orderID, TenantID: o.TenantID, UserID: o.UserID, TotalCents: o.TotalCents,
 	})
 	return err == nil, err
 }

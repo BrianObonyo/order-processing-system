@@ -8,16 +8,22 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
+	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 	"github.com/BrianObonyo/order-processing-system/internal/middleware"
 	"github.com/BrianObonyo/order-processing-system/internal/services"
 )
 
 type OrderAPI interface {
-	CreateOrder(context.Context, string, string, []order.CreateItem) (*services.CreateOrderResult, error)
-	GetOrder(context.Context, string, string) (*order.Order, error)
-	ListOrders(context.Context, string, int, int) (*services.OrderPage, error)
-	CancelOrder(context.Context, string, string) error
+	CreateOrder(context.Context, identity.Identity, string, []order.CreateItem) (*services.CreateOrderResult, error)
+	GetOrder(context.Context, identity.Identity, string) (*order.Order, error)
+	ListOrders(context.Context, identity.Identity, int, int) (*services.OrderPage, error)
+	CancelOrder(context.Context, identity.Identity, string) error
+}
+
+type PaymentAPI interface {
+	RetryPayment(context.Context, identity.Identity, string) (*payment.Payment, error)
 }
 
 type OrderHandler struct{ svc OrderAPI }
@@ -47,7 +53,7 @@ func (h *OrderHandler) Create(c *gin.Context) {
 		items[i] = order.CreateItem{ProductID: it.ProductID, Quantity: it.Quantity}
 	}
 
-	res, err := h.svc.CreateOrder(c.Request.Context(), middleware.UserID(c), middleware.IdempotencyKey(c), items)
+	res, err := h.svc.CreateOrder(c.Request.Context(), middleware.RequestIdentity(c), middleware.IdempotencyKey(c), items)
 	if err != nil {
 		handleServiceError(c, err)
 		return
@@ -61,7 +67,7 @@ func (h *OrderHandler) Create(c *gin.Context) {
 }
 
 func (h *OrderHandler) Get(c *gin.Context) {
-	o, err := h.svc.GetOrder(c.Request.Context(), middleware.UserID(c), c.Param("id"))
+	o, err := h.svc.GetOrder(c.Request.Context(), middleware.RequestIdentity(c), c.Param("id"))
 	if err != nil {
 		handleServiceError(c, err)
 		return
@@ -74,7 +80,7 @@ func (h *OrderHandler) List(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.svc.ListOrders(c.Request.Context(), middleware.UserID(c), page, pageSize)
+	result, err := h.svc.ListOrders(c.Request.Context(), middleware.RequestIdentity(c), page, pageSize)
 	if err != nil {
 		handleServiceError(c, err)
 		return
@@ -109,9 +115,22 @@ func parsePositiveQuery(c *gin.Context, key string, fallback int) (int, error) {
 }
 
 func (h *OrderHandler) Cancel(c *gin.Context) {
-	if err := h.svc.CancelOrder(c.Request.Context(), middleware.UserID(c), c.Param("id")); err != nil {
+	if err := h.svc.CancelOrder(c.Request.Context(), middleware.RequestIdentity(c), c.Param("id")); err != nil {
 		handleServiceError(c, err)
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+func (h *OrderHandler) RetryPayment(c *gin.Context, payments PaymentAPI) {
+	attempt, err := payments.RetryPayment(c.Request.Context(), middleware.RequestIdentity(c), c.Param("id"))
+	if err != nil {
+		handleServiceError(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"payment_id":     attempt.ID,
+		"attempt_number": attempt.AttemptNumber,
+		"status":         attempt.Status,
+	})
 }

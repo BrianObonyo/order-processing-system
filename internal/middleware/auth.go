@@ -4,28 +4,44 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 )
 
 const (
-	userKey = "user_id"
-	idemKey = "idempotency_key"
+	identityKey = "identity"
+	idemKey     = "idempotency_key"
 )
 
 func abort(c *gin.Context, status int, code, msg string) {
 	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": code, "message": msg}})
 }
 
-// APIKeyAuth authenticates the X-API-Key header against a key -> user map.
-func APIKeyAuth(keys map[string]string) gin.HandlerFunc {
+// APIKeyAuth authenticates the X-API-Key header to a tenant-scoped identity.
+func APIKeyAuth(keys map[string]identity.Identity) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		user, ok := keys[c.GetHeader("X-API-Key")]
-		if !ok {
+		id, ok := keys[c.GetHeader("X-API-Key")]
+		if !ok || !id.IsValid() {
 			abort(c, http.StatusUnauthorized, "unauthorized", "missing or invalid X-API-Key header")
 			return
 		}
-		c.Set(userKey, user)
+		c.Set(identityKey, id)
 		c.Next()
 	}
 }
 
-func UserID(c *gin.Context) string { return c.GetString(userKey) }
+func RequestIdentity(c *gin.Context) identity.Identity {
+	id, _ := c.Get(identityKey)
+	result, _ := id.(identity.Identity)
+	return result
+}
+
+func RequireRole(role identity.Role) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if RequestIdentity(c).Role != role {
+			abort(c, http.StatusForbidden, "forbidden", "this API key does not have permission for this operation")
+			return
+		}
+		c.Next()
+	}
+}

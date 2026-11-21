@@ -12,13 +12,13 @@ import (
 )
 
 const selectOrder = `
-	SELECT id::text, user_id, status, total_cents, COALESCE(cancel_reason, ''), created_at, updated_at
+	SELECT id::text, tenant_id, user_id, status, total_cents, COALESCE(cancel_reason, ''), created_at, updated_at
 	FROM orders`
 
 func scanOrder(row pgx.Row) (*order.Order, error) {
 	var o order.Order
 	var status string
-	err := row.Scan(&o.ID, &o.UserID, &status, &o.TotalCents, &o.CancelReason, &o.CreatedAt, &o.UpdatedAt)
+	err := row.Scan(&o.ID, &o.TenantID, &o.UserID, &status, &o.TotalCents, &o.CancelReason, &o.CreatedAt, &o.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, order.ErrNotFound
 	}
@@ -32,21 +32,21 @@ func scanOrder(row pgx.Row) (*order.Order, error) {
 func (q *Queries) InsertOrder(ctx context.Context, o *order.Order) error {
 	_, err := q.db.Exec(ctx,
 		`WITH inserted AS (
-			INSERT INTO orders (id, user_id, status, total_cents)
-			VALUES ($1, $2, $3, $4)
-			RETURNING id, status, created_at
+			INSERT INTO orders (id, tenant_id, user_id, status, total_cents)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING id, tenant_id, status, created_at
 		)
-		INSERT INTO order_status_history (order_id, from_status, to_status, changed_at)
-		SELECT id, NULL, status, created_at FROM inserted`,
-		o.ID, o.UserID, string(o.Status), o.TotalCents)
+		INSERT INTO order_status_history (tenant_id, order_id, from_status, to_status, changed_at)
+		SELECT tenant_id, id, NULL, status, created_at FROM inserted`,
+		o.ID, o.TenantID, o.UserID, string(o.Status), o.TotalCents)
 	return err
 }
 
-func (q *Queries) InsertOrderItems(ctx context.Context, orderID string, items []order.Item) error {
+func (q *Queries) InsertOrderItems(ctx context.Context, tenantID, orderID string, items []order.Item) error {
 	for _, it := range items {
 		if _, err := q.db.Exec(ctx, `
-			INSERT INTO order_items (order_id, product_id, quantity, unit_price_cents)
-			VALUES ($1, $2, $3, $4)`, orderID, it.ProductID, it.Quantity, it.UnitPriceCents); err != nil {
+			INSERT INTO order_items (tenant_id, order_id, product_id, quantity, unit_price_cents)
+			VALUES ($1, $2, $3, $4, $5)`, tenantID, orderID, it.ProductID, it.Quantity, it.UnitPriceCents); err != nil {
 			return err
 		}
 	}
@@ -63,17 +63,28 @@ func (q *Queries) GetOrder(ctx context.Context, id string) (*order.Order, error)
 	return o, err
 }
 
+func (q *Queries) GetOrderForTenant(ctx context.Context, tenantID, id string) (*order.Order, error) {
+	o, err := scanOrder(q.db.QueryRow(ctx, selectOrder+` WHERE tenant_id = $1 AND id = $2`, tenantID, id))
+	if err != nil {
+		return nil, err
+	}
+	o.Items, err = q.GetOrderItems(ctx, id)
+	return o, err
+}
+
 // ListOrders returns one user's orders, newest first, with a stable tie-breaker.
-func (q *Queries) ListOrders(ctx context.Context, userID string, limit, offset int) ([]*order.Order, int64, error) {
+func (q *Queries) ListOrders(ctx context.Context, tenantID, userID string, limit, offset int) ([]*order.Order, int64, error) {
 	var total int64
-	if err := q.db.QueryRow(ctx, `SELECT count(*) FROM orders WHERE user_id = $1`, userID).Scan(&total); err != nil {
+	if err := q.db.QueryRow(ctx, `
+		SELECT count(*) FROM orders WHERE tenant_id = $1 AND ($2 = '' OR user_id = $2)`,
+		tenantID, userID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := q.db.Query(ctx, selectOrder+`
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND ($2 = '' OR user_id = $2)
 		ORDER BY created_at DESC, id DESC
-		LIMIT $2 OFFSET $3`, userID, limit, offset)
+		LIMIT $3 OFFSET $4`, tenantID, userID, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -139,10 +150,10 @@ func (q *Queries) SetOrderStatus(ctx context.Context, id string, from, to order.
 			UPDATE orders
 			SET status = $3, cancel_reason = NULLIF($4, ''), updated_at = now()
 			WHERE id = $1 AND status = $2
-			RETURNING id, status, updated_at
+			RETURNING id, tenant_id, status, updated_at
 		)
-		INSERT INTO order_status_history (order_id, from_status, to_status, reason, changed_at)
-		SELECT id, $2, status, NULLIF($4, ''), updated_at FROM changed`,
+		INSERT INTO order_status_history (tenant_id, order_id, from_status, to_status, reason, changed_at)
+		SELECT tenant_id, id, $2, status, NULLIF($4, ''), updated_at FROM changed`,
 		id, string(from), string(to), reason)
 	if err != nil {
 		return false, err

@@ -14,8 +14,9 @@ import (
 type Repository interface {
 	WithinTransaction(context.Context, func(Transaction) error) error
 	GetOrder(context.Context, string) (*order.Order, error)
-	ListOrders(context.Context, string, int, int) ([]*order.Order, int64, error)
-	ListProductStock(context.Context) ([]inventory.ProductStock, error)
+	GetOrderForTenant(context.Context, string, string) (*order.Order, error)
+	ListOrders(context.Context, string, string, int, int) ([]*order.Order, int64, error)
+	ListProductStock(context.Context, string) ([]inventory.ProductStock, error)
 	GetPaymentByID(context.Context, string) (*payment.Payment, error)
 	TouchPendingRefund(context.Context, string) error
 	ListStaleRefunds(context.Context, time.Time, int) ([]string, error)
@@ -26,23 +27,23 @@ type Repository interface {
 // Transaction exposes only the operations use cases need inside an atomic
 // database transaction.
 type Transaction interface {
-	ClaimIdempotencyKey(context.Context, string, string, string, string) (bool, error)
-	GetIdempotencyKey(context.Context, string, string) (string, string, error)
+	ClaimIdempotencyKey(context.Context, string, string, string, string, string) (bool, error)
+	GetIdempotencyKey(context.Context, string, string, string) (string, string, error)
 	GetOrder(context.Context, string) (*order.Order, error)
-	GetProductPrices(context.Context, []string) (map[string]int64, error)
-	ReserveStock(context.Context, string, int) (bool, error)
+	GetProductPrices(context.Context, string, []string) (map[string]int64, error)
+	ReserveStock(context.Context, string, string, int) (bool, error)
 	InsertOrder(context.Context, *order.Order) error
-	InsertOrderItems(context.Context, string, []order.Item) error
+	InsertOrderItems(context.Context, string, string, []order.Item) error
 	InsertOutbox(context.Context, string, string, any) error
 	LockOrder(context.Context, string) (*order.Order, error)
 	GetOrderItems(context.Context, string) ([]order.Item, error)
-	ReleaseStock(context.Context, string, int) error
-	CommitStock(context.Context, string, int) error
+	ReleaseStock(context.Context, string, string, int) error
+	CommitStock(context.Context, string, string, int) error
 	SetOrderStatus(context.Context, string, order.Status, order.Status, string) (bool, error)
 	FailProcessingPayment(context.Context, string, string) error
 	BumpRecovery(context.Context, string) error
-	GetLatestPaymentAttemptByOrder(context.Context, string) (*payment.Payment, error)
-	InsertPaymentAttempt(context.Context, string, string, int64) error
+	GetLatestPaymentAttemptByOrder(context.Context, string, string) (*payment.Payment, error)
+	InsertPaymentAttempt(context.Context, string, string, string, int64) error
 	GetPaymentByID(context.Context, string) (*payment.Payment, error)
 	SetPaymentResult(context.Context, string, payment.Status, string) error
 	TransitionPaymentStatus(context.Context, string, payment.Status, payment.Status, string) (bool, error)

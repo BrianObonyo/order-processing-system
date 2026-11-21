@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
 )
 
@@ -24,9 +25,9 @@ type Config struct {
 	KafkaGroupID    string
 	KafkaPartitions int
 
-	// APIKeys maps API key -> user ID. Dev-grade authentication; swap the
+	// APIKeys maps API key -> tenant-scoped identity. Dev-grade authentication; swap the
 	// middleware for JWT/OIDC in a real deployment.
-	APIKeys      map[string]string
+	APIKeys      map[string]identity.Identity
 	MetricsToken string
 
 	RunWorkers bool
@@ -195,7 +196,7 @@ func Load() (*Config, error) {
 		OrderPaymentTimeout:    orderPaymentTimeout,
 		PaymentRetryAfter:      paymentRetryAfter,
 		PaymentMaxRecovery:     paymentMaxRecovery,
-		APIKeys:                map[string]string{},
+		APIKeys:                map[string]identity.Identity{},
 	}
 
 	for i, broker := range c.KafkaBrokers {
@@ -210,18 +211,26 @@ func Load() (*Config, error) {
 		if pair == "" {
 			continue
 		}
-		key, user, ok := strings.Cut(pair, ":")
-		key, user = strings.TrimSpace(key), strings.TrimSpace(user)
-		if !ok || key == "" || user == "" {
-			return nil, fmt.Errorf("API_KEYS entries must look like key:user")
+		parts := strings.Split(pair, ":")
+		if len(parts) != 4 {
+			return nil, fmt.Errorf("API_KEYS entries must look like key:tenant:user:role")
+		}
+		key := strings.TrimSpace(parts[0])
+		id := identity.Identity{
+			TenantID: strings.TrimSpace(parts[1]),
+			UserID:   strings.TrimSpace(parts[2]),
+			Role:     identity.Role(strings.ToLower(strings.TrimSpace(parts[3]))),
+		}
+		if key == "" || !id.IsValid() {
+			return nil, fmt.Errorf("API_KEYS entries must include a key, tenant, user, and valid user/admin role")
 		}
 		if _, exists := c.APIKeys[key]; exists {
 			return nil, fmt.Errorf("API_KEYS contains duplicate entries")
 		}
-		c.APIKeys[key] = user
+		c.APIKeys[key] = id
 	}
 	if len(c.APIKeys) == 0 {
-		return nil, fmt.Errorf("API_KEYS must contain at least one key:user pair")
+		return nil, fmt.Errorf("API_KEYS must contain at least one key:tenant:user:role entry")
 	}
 	if err := c.validate(); err != nil {
 		return nil, err

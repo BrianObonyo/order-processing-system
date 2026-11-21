@@ -29,7 +29,8 @@ func Idempotency(locker Locker) gin.HandlerFunc {
 		c.Set(idemKey, key)
 
 		if locker != nil {
-			release, ok, err := locker.Acquire(c.Request.Context(), "idem:"+UserID(c)+":"+key, 30*time.Second)
+			id := RequestIdentity(c)
+			release, ok, err := locker.Acquire(c.Request.Context(), "idem:"+id.TenantID+":"+id.UserID+":"+key, 30*time.Second)
 			switch {
 			case err != nil:
 				slog.Warn("idempotency lock unavailable, relying on database", "err", err)

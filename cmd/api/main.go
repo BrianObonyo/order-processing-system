@@ -43,6 +43,9 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+	if err := postgres.ValidateTenants(ctx, pool, cfg.APIKeys); err != nil {
+		return err
+	}
 
 	rds := redisinfra.New(cfg.RedisAddr)
 	defer func() {
@@ -104,6 +107,7 @@ func run() error {
 	router := handlers.NewRouter(handlers.Deps{
 		Orders:              orderSvc,
 		Products:            productSvc,
+		Payments:            paymentSvc,
 		APIKeys:             cfg.APIKeys,
 		MetricsToken:        cfg.MetricsToken,
 		Locker:              rds,

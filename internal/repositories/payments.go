@@ -12,22 +12,22 @@ import (
 
 // InsertPaymentAttempt appends an attempt. Callers hold the order lock so the
 // next attempt number is allocated serially for that order.
-func (q *Queries) InsertPaymentAttempt(ctx context.Context, id, orderID string, amountCents int64) error {
+func (q *Queries) InsertPaymentAttempt(ctx context.Context, id, tenantID, orderID string, amountCents int64) error {
 	_, err := q.db.Exec(ctx, `
-		INSERT INTO payment_attempts (id, order_id, attempt_number, amount_cents, status)
-		SELECT $1, $2, COALESCE(MAX(attempt_number), 0) + 1, $3, 'PROCESSING'
-		FROM payment_attempts WHERE order_id = $2`, id, orderID, amountCents)
+		INSERT INTO payment_attempts (id, tenant_id, order_id, attempt_number, amount_cents, status)
+		SELECT $1, $2, $3, COALESCE(MAX(attempt_number), 0) + 1, $4, 'PROCESSING'
+		FROM payment_attempts WHERE tenant_id = $2 AND order_id = $3`, id, tenantID, orderID, amountCents)
 	return err
 }
 
-func (q *Queries) GetLatestPaymentAttemptByOrder(ctx context.Context, orderID string) (*payment.Payment, error) {
+func (q *Queries) GetLatestPaymentAttemptByOrder(ctx context.Context, tenantID, orderID string) (*payment.Payment, error) {
 	var p payment.Payment
 	var status string
 	err := q.db.QueryRow(ctx, `
-		SELECT id::text, order_id::text, attempt_number, amount_cents, status, COALESCE(failure_reason, '')
-		FROM payment_attempts WHERE order_id = $1
-		ORDER BY attempt_number DESC LIMIT 1`, orderID).
-		Scan(&p.ID, &p.OrderID, &p.AttemptNumber, &p.AmountCents, &status, &p.FailureReason)
+		SELECT id::text, tenant_id, order_id::text, attempt_number, amount_cents, status, COALESCE(failure_reason, '')
+		FROM payment_attempts WHERE tenant_id = $1 AND order_id = $2
+		ORDER BY attempt_number DESC LIMIT 1`, tenantID, orderID).
+		Scan(&p.ID, &p.TenantID, &p.OrderID, &p.AttemptNumber, &p.AmountCents, &status, &p.FailureReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, payment.ErrNotFound
 	}
@@ -42,9 +42,9 @@ func (q *Queries) GetPaymentByID(ctx context.Context, id string) (*payment.Payme
 	var p payment.Payment
 	var status string
 	err := q.db.QueryRow(ctx, `
-		SELECT id::text, order_id::text, attempt_number, amount_cents, status, COALESCE(failure_reason, '')
+		SELECT id::text, tenant_id, order_id::text, attempt_number, amount_cents, status, COALESCE(failure_reason, '')
 		FROM payment_attempts WHERE id = $1`, id).
-		Scan(&p.ID, &p.OrderID, &p.AttemptNumber, &p.AmountCents, &status, &p.FailureReason)
+		Scan(&p.ID, &p.TenantID, &p.OrderID, &p.AttemptNumber, &p.AmountCents, &status, &p.FailureReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, payment.ErrNotFound
 	}

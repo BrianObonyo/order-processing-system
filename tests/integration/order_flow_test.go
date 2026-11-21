@@ -9,14 +9,18 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/BrianObonyo/order-processing-system/internal/domain/event"
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
+	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/payment"
+	"github.com/BrianObonyo/order-processing-system/internal/infrastructure/postgres"
 	"github.com/BrianObonyo/order-processing-system/internal/messaging"
 	"github.com/BrianObonyo/order-processing-system/internal/repositories"
 	"github.com/BrianObonyo/order-processing-system/internal/services"
@@ -38,7 +42,7 @@ func TestIdempotentCreateUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := svc.CreateOrder(context.Background(), "user-1", key, items)
+			res, err := svc.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), key, items)
 			if err != nil {
 				t.Errorf("create: %v", err)
 				return
@@ -64,7 +68,7 @@ func TestIdempotentCreateUnderConcurrency(t *testing.T) {
 	}
 
 	// Same key, different body: rejected.
-	_, err := svc.CreateOrder(context.Background(), "user-1", key, []order.CreateItem{{ProductID: product, Quantity: 5}})
+	_, err := svc.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), key, []order.CreateItem{{ProductID: product, Quantity: 5}})
 	if !errors.Is(err, order.ErrIdempotencyMismatch) {
 		t.Fatalf("err=%v, want ErrIdempotencyMismatch", err)
 	}
@@ -77,7 +81,7 @@ func TestRejectedOrderRollsBackEverything(t *testing.T) {
 	plenty := testutil.SeedProduct(t, pool, 100)
 	scarce := testutil.SeedProduct(t, pool, 1)
 
-	_, err := svc.CreateOrder(context.Background(), "user-1", "key-rollback-1", []order.CreateItem{
+	_, err := svc.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-rollback-1", []order.CreateItem{
 		{ProductID: plenty, Quantity: 5}, {ProductID: scarce, Quantity: 2},
 	})
 	if err == nil {
@@ -106,7 +110,7 @@ func TestCustomPricingPolicyIsAppliedToOrderTotal(t *testing.T) {
 	)))
 	product := testutil.SeedProduct(t, pool, 5)
 
-	result, err := orders.CreateOrder(context.Background(), "user-1", "key-custom-pricing-1",
+	result, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-custom-pricing-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 2}})
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +135,7 @@ func TestOrderValidatorCanRejectBeforePersistence(t *testing.T) {
 	))
 	product := testutil.SeedProduct(t, pool, 5)
 
-	_, err := orders.CreateOrder(context.Background(), "user-1", "key-policy-reject-1",
+	_, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-policy-reject-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 2}})
 	if err == nil {
 		t.Fatal("expected policy rejection")
@@ -152,20 +156,20 @@ func TestListOrdersPaginatesAndScopesToUser(t *testing.T) {
 	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 10)
 	for _, userID := range []string{"user-1", "user-1", "user-1", "user-2"} {
-		if _, err := orders.CreateOrder(context.Background(), userID, uuid.NewString(),
+		if _, err := orders.CreateOrder(context.Background(), testutil.UserIdentity(userID), uuid.NewString(),
 			[]order.CreateItem{{ProductID: product, Quantity: 1}}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	firstPage, err := orders.ListOrders(context.Background(), "user-1", 1, 2)
+	firstPage, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstPage.Total != 3 || len(firstPage.Orders) != 2 || firstPage.Page != 1 {
 		t.Fatalf("first page=%+v, want total 3 and 2 orders", firstPage)
 	}
-	secondPage, err := orders.ListOrders(context.Background(), "user-1", 2, 2)
+	secondPage, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 2, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,20 +183,146 @@ func TestListOrdersPaginatesAndScopesToUser(t *testing.T) {
 	}
 }
 
+func TestTenantIsolationAcrossCatalogOrdersAndIdempotency(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	testutil.SeedTenant(t, pool, "tenant-alpha")
+	testutil.SeedTenant(t, pool, "tenant-beta")
+	store := testutil.Store(pool)
+	orders := services.NewOrderService(store)
+	products := services.NewProductService(store)
+	alphaProduct := testutil.SeedProductForTenant(t, pool, "tenant-alpha", 5)
+	betaProduct := testutil.SeedProductForTenant(t, pool, "tenant-beta", 5)
+
+	alphaUser := identity.Identity{TenantID: "tenant-alpha", UserID: "owner", Role: identity.RoleUser}
+	betaUser := identity.Identity{TenantID: "tenant-beta", UserID: "owner", Role: identity.RoleUser}
+	alphaOrder, err := orders.CreateOrder(context.Background(), alphaUser, "tenant-shared-key-001",
+		[]order.CreateItem{{ProductID: alphaProduct, Quantity: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	betaOrder, err := orders.CreateOrder(context.Background(), betaUser, "tenant-shared-key-001",
+		[]order.CreateItem{{ProductID: betaProduct, Quantity: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alphaOrder.Order.ID == betaOrder.Order.ID {
+		t.Fatal("same idempotency key in different tenants returned the same order")
+	}
+
+	alphaOtherUser := testutil.UserIdentity("buyer-2")
+	alphaOtherUser.TenantID = "tenant-alpha"
+	otherOrder, err := orders.CreateOrder(context.Background(), alphaOtherUser, "tenant-alpha-order-002",
+		[]order.CreateItem{{ProductID: alphaProduct, Quantity: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := orders.CreateOrder(context.Background(), alphaUser, "tenant-cross-product-001",
+		[]order.CreateItem{{ProductID: betaProduct, Quantity: 1}}); !errors.Is(err, inventory.ErrUnknownProduct) {
+		t.Fatalf("cross-tenant product create error=%v, want unknown product", err)
+	}
+	if _, err := orders.GetOrder(context.Background(), alphaUser, betaOrder.Order.ID); !errors.Is(err, order.ErrNotFound) {
+		t.Fatalf("cross-tenant user lookup error=%v, want not found", err)
+	}
+	alphaAdmin := testutil.AdminIdentity("tenant-alpha", "admin-1")
+	if _, err := orders.GetOrder(context.Background(), alphaAdmin, betaOrder.Order.ID); !errors.Is(err, order.ErrNotFound) {
+		t.Fatalf("cross-tenant admin lookup error=%v, want not found", err)
+	}
+	if _, err := orders.GetOrder(context.Background(), alphaUser, otherOrder.Order.ID); !errors.Is(err, order.ErrNotFound) {
+		t.Fatalf("other user's order lookup error=%v, want not found", err)
+	}
+	if _, err := orders.GetOrder(context.Background(), alphaAdmin, otherOrder.Order.ID); err != nil {
+		t.Fatalf("same-tenant admin lookup error=%v, want success", err)
+	}
+
+	alphaProducts, err := products.List(context.Background(), "tenant-alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	betaProducts, err := products.List(context.Background(), "tenant-beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alphaProducts) != 1 || alphaProducts[0].ProductID != alphaProduct ||
+		len(betaProducts) != 1 || betaProducts[0].ProductID != betaProduct {
+		t.Fatalf("product lists crossed tenant boundary: alpha=%+v beta=%+v", alphaProducts, betaProducts)
+	}
+
+	alphaPage, err := orders.ListOrders(context.Background(), alphaAdmin, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	betaPage, err := orders.ListOrders(context.Background(), testutil.AdminIdentity("tenant-beta", "admin-2"), 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alphaPage.Total != 2 || betaPage.Total != 1 {
+		t.Fatalf("tenant order totals alpha=%d beta=%d, want 2/1", alphaPage.Total, betaPage.Total)
+	}
+
+	if err := orders.CancelOrder(context.Background(), alphaAdmin, otherOrder.Order.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := orders.CancelOrder(context.Background(), alphaAdmin, betaOrder.Order.ID); !errors.Is(err, order.ErrNotFound) {
+		t.Fatalf("cross-tenant admin cancel error=%v, want not found", err)
+	}
+	var tenantID, reason string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT tenant_id, reason FROM order_status_history WHERE order_id = $1 AND to_status = 'CANCELLED'`,
+		otherOrder.Order.ID).Scan(&tenantID, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if tenantID != "tenant-alpha" || reason != "cancelled by tenant admin" {
+		t.Fatalf("cancel history tenant=%q reason=%q, want tenant-alpha/admin reason", tenantID, reason)
+	}
+	var alphaReserved, betaReserved int
+	if err := pool.QueryRow(context.Background(), `
+		SELECT reserved FROM inventory WHERE tenant_id = $1 AND product_id = $2`, "tenant-alpha", alphaProduct).
+		Scan(&alphaReserved); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `
+		SELECT reserved FROM inventory WHERE tenant_id = $1 AND product_id = $2`, "tenant-beta", betaProduct).
+		Scan(&betaReserved); err != nil {
+		t.Fatal(err)
+	}
+	if alphaReserved != 1 || betaReserved != 1 {
+		t.Fatalf("reserved inventory alpha=%d beta=%d, want 1/1", alphaReserved, betaReserved)
+	}
+}
+
+func TestStartupRejectsUnprovisionedTenant(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	err := postgres.ValidateTenants(context.Background(), pool, map[string]identity.Identity{
+		"valid": {TenantID: "default", UserID: "user-1", Role: identity.RoleUser},
+		"missing": {
+			TenantID: "not-provisioned", UserID: "user-2", Role: identity.RoleUser,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not-provisioned") {
+		t.Fatalf("ValidateTenants() error=%v, want unknown tenant rejected", err)
+	}
+	if err := postgres.ValidateTenants(context.Background(), pool, map[string]identity.Identity{
+		"valid": {TenantID: "default", UserID: "user-1", Role: identity.RoleUser},
+	}); err != nil {
+		t.Fatalf("ValidateTenants() error=%v for migrated default tenant", err)
+	}
+}
+
 func TestCancelPendingOrderReleasesStockAndIsRecorded(t *testing.T) {
 	pool := testutil.StartPostgres(t)
 	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 5)
-	result, err := orders.CreateOrder(context.Background(), "user-1", "key-cancel-order-1",
+	result, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-cancel-order-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 2}})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := orders.CancelOrder(context.Background(), "user-1", result.Order.ID); err != nil {
+	if err := orders.CancelOrder(context.Background(), testutil.UserIdentity("user-1"), result.Order.ID); err != nil {
 		t.Fatal(err)
 	}
-	cancelled, err := orders.GetOrder(context.Background(), "user-1", result.Order.ID)
+	cancelled, err := orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), result.Order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,10 +335,10 @@ func TestCancelPendingOrderReleasesStockAndIsRecorded(t *testing.T) {
 	if n := testutil.Count(t, pool, `SELECT count(*) FROM order_status_history WHERE order_id = $1 AND to_status = 'CANCELLED'`, result.Order.ID); n != 1 {
 		t.Fatalf("cancel status history rows=%d, want 1", n)
 	}
-	if err := orders.CancelOrder(context.Background(), "user-1", result.Order.ID); !errors.Is(err, services.ErrOrderNotCancelable) {
+	if err := orders.CancelOrder(context.Background(), testutil.UserIdentity("user-1"), result.Order.ID); !errors.Is(err, services.ErrOrderNotCancelable) {
 		t.Fatalf("second cancel error=%v, want ErrOrderNotCancelable", err)
 	}
-	if err := orders.CancelOrder(context.Background(), "other-user", result.Order.ID); !errors.Is(err, order.ErrNotFound) {
+	if err := orders.CancelOrder(context.Background(), testutil.UserIdentity("other-user"), result.Order.ID); !errors.Is(err, order.ErrNotFound) {
 		t.Fatalf("other user's cancel error=%v, want not found", err)
 	}
 }
@@ -219,7 +349,7 @@ func TestPaymentSuccessAndDuplicateDelivery(t *testing.T) {
 	payments := services.NewPaymentService(testutil.Store(pool), testutil.StubGateway{})
 	product := testutil.SeedProduct(t, pool, 10)
 
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-pay-0001",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-pay-0001",
 		[]order.CreateItem{{ProductID: product, Quantity: 4}})
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +361,7 @@ func TestPaymentSuccessAndDuplicateDelivery(t *testing.T) {
 		}
 	}
 
-	got, _ := orders.GetOrder(context.Background(), "user-1", res.Order.ID)
+	got, _ := orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID)
 	if got.Status != order.StatusPaid {
 		t.Fatalf("status=%s, want PAID", got.Status)
 	}
@@ -249,13 +379,13 @@ func TestPaymentDeclinedLeavesOrderRetryable(t *testing.T) {
 	payments := services.NewPaymentService(testutil.Store(pool), testutil.StubGateway{Err: payment.ErrDeclined})
 	product := testutil.SeedProduct(t, pool, 10)
 
-	res, _ := orders.CreateOrder(context.Background(), "user-1", "key-decl-001",
+	res, _ := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-decl-001",
 		[]order.CreateItem{{ProductID: product, Quantity: 4}})
 	if err := payments.ProcessOrder(context.Background(), res.Order.ID); err != nil {
 		t.Fatal(err)
 	}
 
-	got, _ := orders.GetOrder(context.Background(), "user-1", res.Order.ID)
+	got, _ := orders.GetOrder(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID)
 	if got.Status != order.StatusPendingPayment {
 		t.Fatalf("status=%s, want PENDING_PAYMENT for another payment attempt", got.Status)
 	}
@@ -274,7 +404,7 @@ func TestPaymentRetryCreatesNewAttemptAndKeepsHistory(t *testing.T) {
 	payments := services.NewPaymentService(testutil.Store(pool), gateway)
 	product := testutil.SeedProduct(t, pool, 10)
 
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-payment-retry-1",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-payment-retry-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 2}})
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +417,13 @@ func TestPaymentRetryCreatesNewAttemptAndKeepsHistory(t *testing.T) {
 	if first != 1 {
 		t.Fatalf("failed first attempt rows=%d, want 1", first)
 	}
-	retry, err := payments.RetryPayment(context.Background(), res.Order.ID)
+	if _, err := payments.RetryPayment(context.Background(), testutil.UserIdentity("user-1"), res.Order.ID); !errors.Is(err, identity.ErrForbidden) {
+		t.Fatalf("user retry error=%v, want admin-only restriction", err)
+	}
+	if _, err := payments.RetryPayment(context.Background(), testutil.AdminIdentity("another-tenant", "admin-1"), res.Order.ID); !errors.Is(err, order.ErrNotFound) {
+		t.Fatalf("cross-tenant admin retry error=%v, want not found", err)
+	}
+	retry, err := payments.RetryPayment(context.Background(), testutil.AdminIdentity("default", "admin-1"), res.Order.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +451,7 @@ func TestSetOrderStatusRejectsInvalidTransitionWithoutHistory(t *testing.T) {
 	pool := testutil.StartPostgres(t)
 	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 1)
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-status-history-1",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-status-history-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
 	if err != nil {
 		t.Fatal(err)
@@ -371,7 +507,7 @@ func TestOutboxRelayPublishesEachEventOnce(t *testing.T) {
 	orders := services.NewOrderService(testutil.Store(pool))
 	product := testutil.SeedProduct(t, pool, 10)
 
-	res, err := orders.CreateOrder(context.Background(), "user-1", "key-outbox-1",
+	res, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("user-1"), "key-outbox-1",
 		[]order.CreateItem{{ProductID: product, Quantity: 1}})
 	if err != nil {
 		t.Fatal(err)
@@ -438,5 +574,64 @@ func TestOutboxEventIDMigrationCanRollback(t *testing.T) {
 	}
 	if exists {
 		t.Fatal("event_id column still exists after rollback")
+	}
+}
+
+func TestTenantMigrationCanRollback(t *testing.T) {
+	pool := testutil.StartPostgres(t)
+	product := testutil.SeedProduct(t, pool, 2)
+	store := testutil.Store(pool)
+	orders := services.NewOrderService(store)
+	result, err := orders.CreateOrder(context.Background(), testutil.UserIdentity("migration-user"),
+		"tenant-migration-rollback-1", []order.CreateItem{{ProductID: product, Quantity: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := services.NewPaymentService(store, testutil.StubGateway{}).ProcessOrder(context.Background(), result.Order.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, currentFile, _, _ := runtime.Caller(0)
+	downPath := filepath.Join(filepath.Dir(currentFile), "..", "..", "migrations", "000006_tenant_isolation.down.sql")
+	sql, err := os.ReadFile(downPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), string(sql)); err != nil {
+		t.Fatalf("run tenant isolation down migration: %v", err)
+	}
+
+	var tenantColumnExists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'orders' AND column_name = 'tenant_id'
+		)`,
+	).Scan(&tenantColumnExists); err != nil {
+		t.Fatal(err)
+	}
+	if tenantColumnExists {
+		t.Fatal("tenant_id column still exists after rollback")
+	}
+	var tenantsTableExists bool
+	if err := pool.QueryRow(context.Background(), `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.tables
+			WHERE table_name = 'tenants'
+		)`,
+	).Scan(&tenantsTableExists); err != nil {
+		t.Fatal(err)
+	}
+	if tenantsTableExists {
+		t.Fatal("tenants table still exists after rollback")
+	}
+	for _, table := range []string{"orders", "order_items", "payment_attempts", "idempotency_keys", "outbox", "order_status_history"} {
+		if count := testutil.Count(t, pool, `SELECT count(*) FROM `+table); count == 0 {
+			t.Errorf("%s rows were lost during migration rollback", table)
+		}
+	}
+	var oldInventoryKey string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT product_id::text FROM inventory WHERE product_id = $1`, product).Scan(&oldInventoryKey); err != nil {
+		t.Fatalf("inventory row was lost during migration rollback: %v", err)
 	}
 }

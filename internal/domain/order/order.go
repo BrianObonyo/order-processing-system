@@ -46,6 +46,7 @@ type Item struct {
 
 type Order struct {
 	ID           string    `json:"id"`
+	TenantID     string    `json:"tenant_id"`
 	UserID       string    `json:"user_id"`
 	Status       Status    `json:"status"`
 	TotalCents   int64     `json:"total_cents"`

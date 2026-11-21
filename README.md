@@ -58,7 +58,7 @@ POST /orders ──► PENDING_PAYMENT ──► PAID
 
 1. **API** (one DB transaction): claim the idempotency key, reserve stock, insert the order, write an `order.created` row to the outbox.
 2. **Outbox relay** publishes versioned event envelopes to Kafka and marks outbox rows published.
-3. **Payment consumer group** reads `order.created`, creates or loads the current payment attempt, and charges through a simulated gateway. Multiple group members process separate Kafka partitions concurrently while preserving order within each partition.
+3. **Payment consumer group** reads `order.created`, creates or loads the current payment attempt, and charges through the configured gateway provider. Multiple group members process separate Kafka partitions concurrently while preserving order within each partition.
 4. **Success**: stock reservation becomes a real deduction, order becomes `PAID`. **Decline**: the attempt is recorded as `FAILED`; the order and stock reservation remain pending so another attempt can be started.
 5. **Recovery worker** re-emits events for stalled orders with a bounded delay/retry budget, checks the gateway before cancelling an order with an uncertain charge, and retries pending refunds. A late successful charge is refunded by the gateway before it is marked `REFUNDED`.
 
@@ -69,6 +69,14 @@ Every Kafka message uses an envelope containing an event ID, type, schema versio
 Payment and refund processing is attempted once per delivery; transient failures are retried by the database-backed recovery worker instead of sleeping and retrying inside a Kafka partition. `PAYMENT_CONSUMER_WORKERS` controls the number of group members (default 3); effective concurrency is limited by `KAFKA_PARTITIONS` (default 3). Existing Kafka topics are not resized automatically; coordinate partition increases with Kafka administration because changing a keyed topic's partition count can change key-to-partition assignments. `PAYMENT_GATEWAY_MAX_ATTEMPTS` defaults to 1 to avoid multiplying gateway retries by recovery retries.
 
 `PAYMENT_GATEWAY_PROVIDER` selects the registered payment adapter. Development defaults to `simulated`; production must explicitly select a non-simulated provider. The registry currently includes only the simulated development adapter, so a production provider must be implemented and registered before production startup. Provider adapters must support idempotent charge/refund operations and charge lookup; gateway contract tests in `internal/services/gateway_registry_test.go` define those expectations.
+
+## Tenant isolation and authorization
+
+Migration `000006_tenant_isolation` creates a `default` tenant and backfills existing catalog, inventory, order, payment-attempt, idempotency, status-history, and outbox rows into it. Products and inventory are tenant-specific, and composite foreign keys prevent an order from referencing another tenant's product or stock. Existing installations must apply the migration before starting this version.
+
+Configure each API key as `key:tenant:user:role`, for example `dev-key-1:default:user-1:user` or `dev-admin-key:default:operator:admin`. Separate entries may share a tenant but should use distinct API keys. Every configured tenant must already exist in `tenants`; startup checks this and fails for unknown tenant IDs. Create additional tenant records through the controlled database provisioning process before adding keys for them. The example uses the backfilled `default` tenant.
+
+Regular users can browse their tenant catalog, create orders, and view/cancel their own pending orders. Tenant admins can list and view all orders in their tenant, cancel pending orders, and request a new payment attempt after a decline. Admins cannot access another tenant's data. The retry endpoint queues the attempt; normal workers process it asynchronously.
 
 ## Operations and security
 
@@ -99,7 +107,7 @@ Order transitions are defined in the domain transition table and validated by th
 | Objective | Mechanism |
 |---|---|
 | Prevent overselling | One atomic `UPDATE inventory SET reserved = reserved + n WHERE on_hand - reserved >= n`; `CHECK` constraints as a backstop; stock rows locked in sorted order (no deadlocks). PostgreSQL is the source of truth, Redis never decides stock. |
-| Prevent duplicate orders | `Idempotency-Key` is claimed inside the order transaction (primary key `(user_id, key)`). Concurrent duplicates block on the unique index and then replay the stored order. Same key with a different body returns 422. |
+| Prevent duplicate orders | `Idempotency-Key` is claimed inside the order transaction (primary key `(tenant_id, user_id, key)`). Concurrent duplicates block on the unique index and then replay the stored order. Same key with a different body returns 422. |
 | Prevent duplicate charges and preserve attempt history | `payment_attempts` stores every charge attempt; `UNIQUE (order_id, attempt_number)` allocates distinct attempts and gateway calls are idempotent by attempt ID. |
 | Handle concurrent requests | Row-level locks, atomic updates, `FOR UPDATE SKIP LOCKED` in the relay, Redis lock to cheaply reject in-flight duplicates (fails open). |
 | Recover from failures | Transactional outbox (no lost events), at-least-once consumers that are idempotent, dead-lettering for malformed events, circuit breaker, recovery worker with retry budget and timeout compensation. |

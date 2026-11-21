@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -20,10 +21,17 @@ func (q *Queries) InsertOutbox(ctx context.Context, aggregateID, eventType strin
 	if err != nil {
 		return err
 	}
-	_, err = q.db.Exec(ctx,
-		`INSERT INTO outbox (aggregate_id, event_type, payload) VALUES ($1, $2, $3)`,
+	tag, err := q.db.Exec(ctx, `
+		INSERT INTO outbox (tenant_id, aggregate_id, event_type, payload)
+		SELECT tenant_id, id, $2, $3 FROM orders WHERE id = $1`,
 		aggregateID, eventType, b)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("insert outbox event: order %s not found", aggregateID)
+	}
+	return nil
 }
 
 // FetchUnpublished locks a batch of pending events. SKIP LOCKED lets several

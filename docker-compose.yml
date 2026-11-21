@@ -60,7 +60,7 @@ services:
       DATABASE_URL: postgres://orders:orders@postgres:5432/orders?sslmode=disable
       REDIS_ADDR: redis:6379
       KAFKA_BROKERS: kafka:9092
-      API_KEYS: dev-key-1:user-1,dev-key-2:user-2
+      API_KEYS: dev-key-1:default:user-1:user,dev-key-2:default:user-2:user,dev-admin-key:default:operator:admin
       PAYMENT_GATEWAY_PROVIDER: simulated
     depends_on:
       migrate: { condition: service_completed_successfully }

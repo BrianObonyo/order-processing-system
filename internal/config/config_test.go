@@ -10,7 +10,7 @@ import (
 
 func TestLoadDefaults(t *testing.T) {
 	setDefaultConfigEnv(t)
-	t.Setenv("API_KEYS", "key-1234:user")
+	t.Setenv("API_KEYS", "key-1234:default:user:user")
 
 	cfg, err := Load()
 	if err != nil {
@@ -60,7 +60,7 @@ func TestLoadAcceptsStrongProductionConfiguration(t *testing.T) {
 
 func TestLoadRejectsWeakProductionCredentials(t *testing.T) {
 	setProductionConfigEnv(t)
-	t.Setenv("API_KEYS", "dev-key-1:user-1")
+	t.Setenv("API_KEYS", "dev-key-1:default:user-1:user")
 
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "32 characters") {
@@ -104,8 +104,10 @@ func TestLoadDoesNotExposeAPIKeysInConfigurationErrors(t *testing.T) {
 		name  string
 		value string
 	}{
-		{name: "malformed entry", value: secret + ":"},
-		{name: "duplicate entry", value: secret + ":user-1," + secret + ":user-2"},
+		{name: "malformed entry", value: secret + ":tenant:user:"},
+		{name: "duplicate entry", value: secret + ":tenant:user-1:user," + secret + ":tenant:user-2:admin"},
+		{name: "invalid role", value: secret + ":tenant:user-1:owner"},
+		{name: "empty tenant", value: secret + "::user-1:user"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -147,7 +149,7 @@ func TestLoadRejectsMalformedConfiguration(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			setDefaultConfigEnv(t)
-			t.Setenv("API_KEYS", "key-1234:user")
+			t.Setenv("API_KEYS", "key-1234:default:user:user")
 			t.Setenv(tt.key, tt.value)
 
 			_, err := Load()
@@ -160,7 +162,7 @@ func TestLoadRejectsMalformedConfiguration(t *testing.T) {
 
 func TestLoadRejectsOverlappingPaymentRates(t *testing.T) {
 	setDefaultConfigEnv(t)
-	t.Setenv("API_KEYS", "key-1234:user")
+	t.Setenv("API_KEYS", "key-1234:default:user:user")
 	t.Setenv("PAYMENT_FAILURE_RATE", "0.7")
 	t.Setenv("PAYMENT_TRANSIENT_RATE", "0.4")
 
@@ -205,7 +207,7 @@ func setDefaultConfigEnv(t *testing.T) {
 	}
 	t.Setenv("APP_ENV", "development")
 	t.Setenv("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable")
-	t.Setenv("API_KEYS", "dev-key-1:user-1,dev-key-2:user-2")
+	t.Setenv("API_KEYS", "dev-key-1:default:user-1:user,dev-key-2:default:user-2:user")
 }
 
 func setProductionConfigEnv(t *testing.T) {
@@ -215,7 +217,7 @@ func setProductionConfigEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://orders:strong-production-secret@postgres:5432/orders?sslmode=require")
 	t.Setenv("REDIS_ADDR", "redis:6379")
 	t.Setenv("KAFKA_BROKERS", "kafka:9092")
-	t.Setenv("API_KEYS", strings.Repeat("a", 32)+":service-user")
+	t.Setenv("API_KEYS", strings.Repeat("a", 32)+":default:service-user:admin")
 	t.Setenv("METRICS_TOKEN", strings.Repeat("m", 32))
 	t.Setenv("PAYMENT_GATEWAY_PROVIDER", "provider-test")
 }

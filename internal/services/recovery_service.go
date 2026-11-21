@@ -79,7 +79,7 @@ func (s *RecoveryService) Sweep(ctx context.Context) (SweepResult, error) {
 			}
 			retried = true
 			return tq.InsertOutbox(ctx, id, order.EventCreated, order.Event{
-				OrderID: id, UserID: o.UserID, TotalCents: o.TotalCents,
+				OrderID: id, TenantID: o.TenantID, UserID: o.UserID, TotalCents: o.TotalCents,
 			})
 		})
 		if err != nil {

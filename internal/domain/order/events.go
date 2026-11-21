@@ -12,6 +12,7 @@ const (
 // Consumers must treat delivery as at-least-once.
 type Event struct {
 	OrderID    string `json:"order_id"`
+	TenantID   string `json:"tenant_id"`
 	PaymentID  string `json:"payment_id,omitempty"`
 	UserID     string `json:"user_id"`
 	TotalCents int64  `json:"total_cents"`

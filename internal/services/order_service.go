@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/BrianObonyo/order-processing-system/internal/domain/identity"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/inventory"
 	"github.com/BrianObonyo/order-processing-system/internal/domain/order"
 	"github.com/BrianObonyo/order-processing-system/internal/metrics"
@@ -49,7 +50,10 @@ var (
 // CreateOrder runs everything in one transaction: claim the idempotency key,
 // reserve stock, insert the order and write the order.created outbox event.
 // Either all of it commits or none of it does.
-func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey string, items []order.CreateItem) (*CreateOrderResult, error) {
+func (s *OrderService) CreateOrder(ctx context.Context, actor identity.Identity, idempotencyKey string, items []order.CreateItem) (*CreateOrderResult, error) {
+	if !actor.IsValid() {
+		return nil, identity.ErrInvalid
+	}
 	norm, err := order.NormalizeItems(items)
 	if err != nil {
 		metrics.OrdersRejected.WithLabelValues("invalid").Inc()
@@ -63,12 +67,12 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 
 	var result *CreateOrderResult
 	err = s.repository.WithinTransaction(ctx, func(q Transaction) error {
-		claimed, err := q.ClaimIdempotencyKey(ctx, userID, idempotencyKey, hash, orderID)
+		claimed, err := q.ClaimIdempotencyKey(ctx, actor.TenantID, actor.UserID, idempotencyKey, hash, orderID)
 		if err != nil {
 			return err
 		}
 		if !claimed {
-			storedHash, existingID, err := q.GetIdempotencyKey(ctx, userID, idempotencyKey)
+			storedHash, existingID, err := q.GetIdempotencyKey(ctx, actor.TenantID, actor.UserID, idempotencyKey)
 			if err != nil {
 				return err
 			}
@@ -83,7 +87,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 			return nil
 		}
 		if s.validator != nil {
-			if err := s.validator.ValidateOrder(ctx, userID, append([]order.CreateItem(nil), norm...)); err != nil {
+			if err := s.validator.ValidateOrder(ctx, actor.UserID, append([]order.CreateItem(nil), norm...)); err != nil {
 				return err
 			}
 		}
@@ -92,13 +96,13 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		for i, it := range norm {
 			ids[i] = it.ProductID
 		}
-		prices, err := q.GetProductPrices(ctx, ids)
+		prices, err := q.GetProductPrices(ctx, actor.TenantID, ids)
 		if err != nil {
 			return err
 		}
 
 		priced, err := s.pricing.Price(ctx, OrderPricingRequest{
-			UserID: userID, Items: append([]order.CreateItem(nil), norm...), CatalogCents: clonePrices(prices),
+			UserID: actor.UserID, Items: append([]order.CreateItem(nil), norm...), CatalogCents: clonePrices(prices),
 		})
 		if err != nil {
 			return err
@@ -108,12 +112,12 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		}
 
 		o := &order.Order{
-			ID: orderID, UserID: userID, Status: order.StatusPendingPayment,
+			ID: orderID, TenantID: actor.TenantID, UserID: actor.UserID, Status: order.StatusPendingPayment,
 			Items: priced.Items, TotalCents: priced.TotalCents,
 		}
 		// norm is sorted by product ID, so stock rows are always locked in the same order.
 		for _, it := range norm {
-			reserved, err := q.ReserveStock(ctx, it.ProductID, it.Quantity)
+			reserved, err := q.ReserveStock(ctx, actor.TenantID, it.ProductID, it.Quantity)
 			if err != nil {
 				return err
 			}
@@ -125,11 +129,11 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 		if err := q.InsertOrder(ctx, o); err != nil {
 			return err
 		}
-		if err := q.InsertOrderItems(ctx, o.ID, o.Items); err != nil {
+		if err := q.InsertOrderItems(ctx, actor.TenantID, o.ID, o.Items); err != nil {
 			return err
 		}
 		if err := q.InsertOutbox(ctx, o.ID, order.EventCreated, order.Event{
-			OrderID: o.ID, UserID: userID, TotalCents: o.TotalCents,
+			OrderID: o.ID, TenantID: actor.TenantID, UserID: actor.UserID, TotalCents: o.TotalCents,
 		}); err != nil {
 			return err
 		}
@@ -155,26 +159,36 @@ func (s *OrderService) CreateOrder(ctx context.Context, userID, idempotencyKey s
 }
 
 // GetOrder returns an order only if it belongs to userID.
-func (s *OrderService) GetOrder(ctx context.Context, userID, id string) (*order.Order, error) {
+func (s *OrderService) GetOrder(ctx context.Context, actor identity.Identity, id string) (*order.Order, error) {
+	if !actor.IsValid() {
+		return nil, identity.ErrInvalid
+	}
 	if _, err := uuid.Parse(id); err != nil {
 		return nil, order.ErrNotFound
 	}
-	o, err := s.repository.GetOrder(ctx, id)
+	o, err := s.repository.GetOrderForTenant(ctx, actor.TenantID, id)
 	if err != nil {
 		return nil, err
 	}
-	if o.UserID != userID {
+	if actor.Role != identity.RoleAdmin && o.UserID != actor.UserID {
 		return nil, order.ErrNotFound // do not reveal other users' orders
 	}
 	return o, nil
 }
 
-func (s *OrderService) ListOrders(ctx context.Context, userID string, page, pageSize int) (*OrderPage, error) {
+func (s *OrderService) ListOrders(ctx context.Context, actor identity.Identity, page, pageSize int) (*OrderPage, error) {
+	if !actor.IsValid() {
+		return nil, identity.ErrInvalid
+	}
 	if page < 1 || pageSize < 1 || pageSize > 100 || page-1 > int(^uint(0)>>1)/pageSize {
 		return nil, ErrInvalidPagination
 	}
 	offset := (page - 1) * pageSize
-	orders, total, err := s.repository.ListOrders(ctx, userID, pageSize, offset)
+	userID := actor.UserID
+	if actor.Role == identity.RoleAdmin {
+		userID = ""
+	}
+	orders, total, err := s.repository.ListOrders(ctx, actor.TenantID, userID, pageSize, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +198,10 @@ func (s *OrderService) ListOrders(ctx context.Context, userID string, page, page
 	return &OrderPage{Orders: orders, Page: page, PageSize: pageSize, Total: total}, nil
 }
 
-func (s *OrderService) CancelOrder(ctx context.Context, userID, id string) error {
+func (s *OrderService) CancelOrder(ctx context.Context, actor identity.Identity, id string) error {
+	if !actor.IsValid() {
+		return identity.ErrInvalid
+	}
 	if _, err := uuid.Parse(id); err != nil {
 		return order.ErrNotFound
 	}
@@ -193,13 +210,17 @@ func (s *OrderService) CancelOrder(ctx context.Context, userID, id string) error
 		if err != nil {
 			return err
 		}
-		if o.UserID != userID {
+		if o.TenantID != actor.TenantID || (actor.Role != identity.RoleAdmin && o.UserID != actor.UserID) {
 			return order.ErrNotFound
 		}
 		if o.Status != order.StatusPendingPayment {
 			return ErrOrderNotCancelable
 		}
-		cancelled, err := cancelLockedPendingOrder(ctx, tx, o, "cancelled by customer")
+		reason := "cancelled by customer"
+		if actor.Role == identity.RoleAdmin {
+			reason = "cancelled by tenant admin"
+		}
+		cancelled, err := cancelLockedPendingOrder(ctx, tx, o, reason)
 		if err != nil {
 			return err
 		}
