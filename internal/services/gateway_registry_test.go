@@ -15,18 +15,18 @@ func TestPayPalGatewayContractWithFakeServer(t *testing.T) {
 	var captureCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/v1/oauth2/token":
+		switch r.URL.Path {
+		case "/v1/oauth2/token":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"access_token":"test-token","expires_in":3600}`))
-		case r.URL.Path == "/v2/checkout/orders":
+		case "/v2/checkout/orders":
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"id":"order-1","status":"CREATED"}`))
-		case r.URL.Path == "/v2/checkout/orders/order-1/capture":
+		case "/v2/checkout/orders/order-1/capture":
 			captureCount++
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"status":"COMPLETED","purchase_units":[{"payments":{"captures":[{"id":"capture-1"}]}}]}`))
-		case r.URL.Path == "/v2/payments/captures/capture-1/refund":
+		case "/v2/payments/captures/capture-1/refund":
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"id":"refund-1","status":"COMPLETED"}`))
 		default:

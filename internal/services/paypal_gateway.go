@@ -80,7 +80,9 @@ func (g *PayPalGateway) Charge(ctx context.Context, idempotencyKey string, amoun
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	if response.StatusCode >= 500 {
 		g.mu.Lock()
 		g.statuses[idempotencyKey] = payment.ChargeStatusPending
@@ -109,7 +111,9 @@ func (g *PayPalGateway) Charge(ctx context.Context, idempotencyKey string, amoun
 	if err != nil {
 		return err
 	}
-	defer captureResponse.Body.Close()
+	defer func() {
+		_ = captureResponse.Body.Close()
+	}()
 	if captureResponse.StatusCode >= 500 {
 		g.mu.Lock()
 		g.statuses[idempotencyKey] = payment.ChargeStatusPending
@@ -165,7 +169,9 @@ func (g *PayPalGateway) Refund(ctx context.Context, paymentID string, amountCent
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	if response.StatusCode >= 500 {
 		return payment.ErrTransient
 	}
@@ -200,7 +206,9 @@ func (g *PayPalGateway) accessToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("PayPal authentication: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	if response.StatusCode >= 500 {
 		return "", payment.ErrTransient
 	}
@@ -239,7 +247,9 @@ func (g *PayPalGateway) do(ctx context.Context, method, path, token, idempotency
 }
 
 func (g *PayPalGateway) payPalError(response *http.Response) error {
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 	payload, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 	message := strings.TrimSpace(string(payload))
 	if message == "" {
