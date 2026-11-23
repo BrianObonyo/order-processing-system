@@ -19,6 +19,7 @@ const (
 type ChargeStatus string
 
 const ProviderSimulated = "simulated"
+const ProviderPayPal = "paypal"
 
 const (
 	ChargeStatusNotFound  ChargeStatus = "NOT_FOUND"

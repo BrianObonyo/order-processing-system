@@ -11,12 +11,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/BrianObonyo/order-processing-system/internal/config"
 	"github.com/BrianObonyo/order-processing-system/internal/handlers"
 	kafkainfra "github.com/BrianObonyo/order-processing-system/internal/infrastructure/kafka"
 	"github.com/BrianObonyo/order-processing-system/internal/infrastructure/postgres"
 	redisinfra "github.com/BrianObonyo/order-processing-system/internal/infrastructure/redis"
 	"github.com/BrianObonyo/order-processing-system/internal/messaging"
+	"github.com/BrianObonyo/order-processing-system/internal/middleware"
 	"github.com/BrianObonyo/order-processing-system/internal/services"
 	"github.com/BrianObonyo/order-processing-system/internal/workers"
 )
@@ -43,8 +46,10 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
-	if err := postgres.ValidateTenants(ctx, pool, cfg.APIKeys); err != nil {
-		return err
+	if cfg.AuthMode == "api_key" {
+		if err := postgres.ValidateTenants(ctx, pool, cfg.APIKeys); err != nil {
+			return err
+		}
 	}
 
 	rds := redisinfra.New(cfg.RedisAddr)
@@ -79,6 +84,7 @@ func run() error {
 	productSvc := services.NewProductService(store)
 	gatewayAdapter, err := services.NewGatewayRegistry().Build(cfg.PaymentGatewayProvider, services.GatewaySettings{
 		DeclineRate: cfg.PaymentFailureRate, TransientRate: cfg.PaymentTransientRate, Latency: cfg.PaymentLatency,
+		ProviderBaseURL: cfg.PaymentProviderBaseURL, ProviderClientID: cfg.PaymentProviderClientID, ProviderSecret: cfg.PaymentProviderSecret,
 	})
 	if err != nil {
 		return err
@@ -104,11 +110,19 @@ func run() error {
 		start(workers.NewRetentionWorker(pool, cfg.RetentionInterval, cfg.OutboxRetention, cfg.IdempotencyRetention, cfg.RetentionBatchSize).Run)
 	}
 
+	var authMiddleware gin.HandlerFunc
+	if cfg.AuthMode == "oidc" {
+		authMiddleware, err = middleware.OIDCAuth(cfg.OIDCIssuer, cfg.OIDCAudience)
+		if err != nil {
+			return err
+		}
+	}
 	router := handlers.NewRouter(handlers.Deps{
 		Orders:              orderSvc,
 		Products:            productSvc,
 		Payments:            paymentSvc,
 		APIKeys:             cfg.APIKeys,
+		Auth:                authMiddleware,
 		MetricsToken:        cfg.MetricsToken,
 		Locker:              rds,
 		MaxRequestBodyBytes: cfg.HTTPMaxBodyBytes,

@@ -68,13 +68,13 @@ Every Kafka message uses an envelope containing an event ID, type, schema versio
 
 Payment and refund processing is attempted once per delivery; transient failures are retried by the database-backed recovery worker instead of sleeping and retrying inside a Kafka partition. `PAYMENT_CONSUMER_WORKERS` controls the number of group members (default 3); effective concurrency is limited by `KAFKA_PARTITIONS` (default 3). Existing Kafka topics are not resized automatically; coordinate partition increases with Kafka administration because changing a keyed topic's partition count can change key-to-partition assignments. `PAYMENT_GATEWAY_MAX_ATTEMPTS` defaults to 1 to avoid multiplying gateway retries by recovery retries.
 
-`PAYMENT_GATEWAY_PROVIDER` selects the registered payment adapter. Development defaults to `simulated`; production must explicitly select a non-simulated provider. The registry currently includes only the simulated development adapter, so a production provider must be implemented and registered before production startup. Provider adapters must support idempotent charge/refund operations and charge lookup; gateway contract tests in `internal/services/gateway_registry_test.go` define those expectations.
+`PAYMENT_GATEWAY_PROVIDER` selects the registered payment adapter. Development defaults to `simulated`; production must explicitly select a non-simulated provider. `paypal` uses PayPal REST Checkout Orders and Captures APIs. Configure `PAYMENT_PROVIDER_BASE_URL` (defaults to the PayPal sandbox), `PAYMENT_PROVIDER_CLIENT_ID`, and `PAYMENT_PROVIDER_SECRET`. Provider adapters must support idempotent charge/refund operations and charge lookup; gateway contract tests in `internal/services/gateway_registry_test.go` define those expectations.
 
 ## Tenant isolation and authorization
 
 Migration `000006_tenant_isolation` creates a `default` tenant and backfills existing catalog, inventory, order, payment-attempt, idempotency, status-history, and outbox rows into it. Products and inventory are tenant-specific, and composite foreign keys prevent an order from referencing another tenant's product or stock. Existing installations must apply the migration before starting this version.
 
-Configure each API key as `key:tenant:user:role`, for example `dev-key-1:default:user-1:user` or `dev-admin-key:default:operator:admin`. Separate entries may share a tenant but should use distinct API keys. Every configured tenant must already exist in `tenants`; startup checks this and fails for unknown tenant IDs. Create additional tenant records through the controlled database provisioning process before adding keys for them. The example uses the backfilled `default` tenant.
+Development can configure each API key as `key:tenant:user:role`, for example `dev-key-1:default:user-1:user` or `dev-admin-key:default:operator:admin`. Set `AUTH_MODE=oidc` for JWT/OIDC authentication and configure `OIDC_ISSUER` and `OIDC_AUDIENCE`. OIDC tokens must contain `tenant_id` (or `tid`), `user_id` (or `sub`), and a `role` or `roles` claim containing `user` or `admin`. API-key tenant IDs must already exist in `tenants`; startup validates configured keys and fails for unknown tenant IDs. Create additional tenant records through the controlled database provisioning process before adding keys for them. The example uses the backfilled `default` tenant.
 
 Regular users can browse their tenant catalog, create orders, and view/cancel their own pending orders. Tenant admins can list and view all orders in their tenant, cancel pending orders, and request a new payment attempt after a decline. Admins cannot access another tenant's data. The retry endpoint queues the attempt; normal workers process it asynchronously.
 
@@ -143,5 +143,5 @@ The integration suite proves the hard guarantees: 100 concurrent buyers on 10 un
 
 - Delivery is at-least-once everywhere; idempotency makes it effectively-once.
 - Rejected requests (for example out of stock) roll back completely, including the idempotency key, so a client retry re-evaluates against current stock.
-- Authentication is a static API-key map. Replace `middleware.APIKeyAuth` with JWT/OIDC for real use.
+- Authentication supports static API keys for development and issuer-verifying JWT/OIDC bearer tokens for deployments. OIDC tokens must include tenant, user, and role claims.
 - `pgx` is used directly. sqlc can replace the hand-written `internal/repositories` later without touching services.

@@ -6,6 +6,7 @@ servers:
   - url: http://localhost:8080
 security:
   - apiKey: []
+  - bearerAuth: []
 paths:
   /api/v1/products:
     get:
@@ -127,6 +128,7 @@ paths:
 components:
   securitySchemes:
     apiKey: { type: apiKey, in: header, name: X-API-Key }
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
   schemas:
     OrderPage:
       type: object

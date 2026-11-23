@@ -35,6 +35,7 @@ func TestLoadDefaults(t *testing.T) {
 func TestLoadRequiresProductionSecretsAndEndpoints(t *testing.T) {
 	setDefaultConfigEnv(t)
 	t.Setenv("APP_ENV", "production")
+	t.Setenv("AUTH_MODE", "api_key")
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("REDIS_ADDR", "")
 	t.Setenv("KAFKA_BROKERS", "")
@@ -95,6 +96,36 @@ func TestLoadRejectsDevelopmentDatabaseCredentialsInProduction(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "development database credentials") {
 		t.Fatalf("Load() error = %v, want development database credential rejection", err)
+	}
+}
+
+func TestLoadAcceptsOIDCAuthentication(t *testing.T) {
+	setProductionConfigEnv(t)
+	t.Setenv("AUTH_MODE", "oidc")
+	t.Setenv("OIDC_ISSUER", "https://issuer.example.com")
+	t.Setenv("OIDC_AUDIENCE", "order-api")
+	t.Setenv("API_KEYS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AuthMode != "oidc" || cfg.OIDCIssuer == "" || cfg.OIDCAudience == "" {
+		t.Fatalf("unexpected OIDC config: %+v", cfg)
+	}
+}
+
+func TestLoadRequiresPayPalCredentials(t *testing.T) {
+	setProductionConfigEnv(t)
+	t.Setenv("AUTH_MODE", "oidc")
+	t.Setenv("OIDC_ISSUER", "https://issuer.example.com")
+	t.Setenv("OIDC_AUDIENCE", "order-api")
+	t.Setenv("API_KEYS", "")
+	t.Setenv("PAYMENT_GATEWAY_PROVIDER", payment.ProviderPayPal)
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "PAYMENT_PROVIDER_CLIENT_ID") {
+		t.Fatalf("Load() error=%v, want PayPal client ID required", err)
 	}
 }
 
@@ -202,10 +233,17 @@ func setDefaultConfigEnv(t *testing.T) {
 		"KAFKA_BROKERS",
 		"KAFKA_TOPIC",
 		"KAFKA_DLQ_TOPIC",
+		"AUTH_MODE",
+		"OIDC_ISSUER",
+		"OIDC_AUDIENCE",
+		"PAYMENT_PROVIDER_BASE_URL",
+		"PAYMENT_PROVIDER_CLIENT_ID",
+		"PAYMENT_PROVIDER_SECRET",
 	} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("APP_ENV", "development")
+	t.Setenv("AUTH_MODE", "api_key")
 	t.Setenv("DATABASE_URL", "postgres://orders:orders@localhost:5432/orders?sslmode=disable")
 	t.Setenv("API_KEYS", "dev-key-1:default:user-1:user,dev-key-2:default:user-2:user")
 }

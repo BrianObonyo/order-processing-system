@@ -1,5 +1,3 @@
-//go:build integration
-
 // Package testutil starts a throwaway PostgreSQL (Testcontainers) with the real
 // migrations applied, so tests exercise the same SQL as production.
 package testutil

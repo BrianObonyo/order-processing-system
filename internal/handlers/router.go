@@ -18,6 +18,7 @@ type Deps struct {
 	Products            ProductAPI
 	Payments            PaymentAPI
 	APIKeys             map[string]identity.Identity
+	Auth                gin.HandlerFunc
 	MetricsToken        string
 	Locker              middleware.Locker // may be nil
 	MaxRequestBodyBytes int64
@@ -67,7 +68,11 @@ func NewRouter(d Deps) *gin.Engine {
 	orders := &OrderHandler{svc: d.Orders}
 	products := &ProductHandler{svc: d.Products}
 
-	v1 := r.Group("/api/v1", middleware.APIKeyAuth(d.APIKeys))
+	auth := d.Auth
+	if auth == nil {
+		auth = middleware.APIKeyAuth(d.APIKeys)
+	}
+	v1 := r.Group("/api/v1", auth)
 	v1.GET("/products", products.List)
 	maxBodyBytes := d.MaxRequestBodyBytes
 	if maxBodyBytes <= 0 {

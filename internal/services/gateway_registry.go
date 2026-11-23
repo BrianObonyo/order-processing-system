@@ -10,9 +10,12 @@ import (
 )
 
 type GatewaySettings struct {
-	DeclineRate   float64
-	TransientRate float64
-	Latency       time.Duration
+	DeclineRate      float64
+	TransientRate    float64
+	Latency          time.Duration
+	ProviderBaseURL  string
+	ProviderClientID string
+	ProviderSecret   string
 }
 
 type GatewayFactory func(GatewaySettings) (payment.Gateway, error)
@@ -25,6 +28,9 @@ func NewGatewayRegistry() *GatewayRegistry {
 	return &GatewayRegistry{factories: map[string]GatewayFactory{
 		payment.ProviderSimulated: func(settings GatewaySettings) (payment.Gateway, error) {
 			return NewSimulatedGateway(settings.DeclineRate, settings.TransientRate, settings.Latency), nil
+		},
+		payment.ProviderPayPal: func(settings GatewaySettings) (payment.Gateway, error) {
+			return NewPayPalGateway(settings.ProviderBaseURL, settings.ProviderClientID, settings.ProviderSecret)
 		},
 	}}
 }

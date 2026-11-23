@@ -14,10 +14,13 @@ import (
 )
 
 type Config struct {
-	AppEnv      string
-	HTTPAddr    string
-	DatabaseURL string
-	RedisAddr   string
+	AppEnv       string
+	HTTPAddr     string
+	DatabaseURL  string
+	RedisAddr    string
+	AuthMode     string
+	OIDCIssuer   string
+	OIDCAudience string
 
 	KafkaBrokers    []string
 	KafkaTopic      string
@@ -25,19 +28,21 @@ type Config struct {
 	KafkaGroupID    string
 	KafkaPartitions int
 
-	// APIKeys maps API key -> tenant-scoped identity. Dev-grade authentication; swap the
-	// middleware for JWT/OIDC in a real deployment.
+	// APIKeys maps API keys to tenant-scoped identities in development mode.
 	APIKeys      map[string]identity.Identity
 	MetricsToken string
 
 	RunWorkers bool
 
-	PaymentConsumerWorkers int
-	PaymentGatewayAttempts int
-	PaymentGatewayProvider string
-	HTTPRateLimit          float64
-	HTTPRateBurst          int
-	HTTPMaxBodyBytes       int64
+	PaymentConsumerWorkers  int
+	PaymentGatewayAttempts  int
+	PaymentGatewayProvider  string
+	PaymentProviderBaseURL  string
+	PaymentProviderClientID string
+	PaymentProviderSecret   string
+	HTTPRateLimit           float64
+	HTTPRateBurst           int
+	HTTPMaxBodyBytes        int64
 
 	OutboxRetention      time.Duration
 	IdempotencyRetention time.Duration
@@ -76,9 +81,22 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	apiKeys, err := envRequired("API_KEYS")
-	if err != nil {
-		return nil, err
+	authModeDefault := "api_key"
+	if appEnv == "production" {
+		authModeDefault = "oidc"
+	}
+	authMode := strings.ToLower(strings.TrimSpace(env("AUTH_MODE", authModeDefault)))
+	if authMode != "api_key" && authMode != "oidc" {
+		return nil, fmt.Errorf("AUTH_MODE must be api_key or oidc")
+	}
+	oidcIssuer := strings.TrimSpace(os.Getenv("OIDC_ISSUER"))
+	oidcAudience := strings.TrimSpace(os.Getenv("OIDC_AUDIENCE"))
+	var apiKeys string
+	if authMode == "api_key" {
+		apiKeys, err = envRequired("API_KEYS")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	runWorkers, err := envBool("RUN_WORKERS", true)
@@ -132,6 +150,9 @@ func Load() (*Config, error) {
 		}
 		paymentGatewayProvider = payment.ProviderSimulated
 	}
+	paymentProviderBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PAYMENT_PROVIDER_BASE_URL")), "/")
+	paymentProviderClientID := strings.TrimSpace(os.Getenv("PAYMENT_PROVIDER_CLIENT_ID"))
+	paymentProviderSecret := strings.TrimSpace(os.Getenv("PAYMENT_PROVIDER_SECRET"))
 	kafkaPartitions, err := envInt("KAFKA_PARTITIONS", 3)
 	if err != nil {
 		return nil, err
@@ -167,36 +188,42 @@ func Load() (*Config, error) {
 
 	kafkaTopic := strings.TrimSpace(env("KAFKA_TOPIC", "order-events"))
 	c := &Config{
-		AppEnv:                 appEnv,
-		HTTPAddr:               env("HTTP_ADDR", ":8080"),
-		DatabaseURL:            databaseURL,
-		RedisAddr:              redisAddr,
-		KafkaBrokers:           strings.Split(kafkaBrokers, ","),
-		KafkaTopic:             kafkaTopic,
-		KafkaDLQTopic:          strings.TrimSpace(env("KAFKA_DLQ_TOPIC", kafkaTopic+".dead-letter")),
-		KafkaGroupID:           env("KAFKA_GROUP_ID", "order-processing"),
-		KafkaPartitions:        kafkaPartitions,
-		MetricsToken:           strings.TrimSpace(os.Getenv("METRICS_TOKEN")),
-		RunWorkers:             runWorkers,
-		PaymentConsumerWorkers: paymentConsumerWorkers,
-		PaymentGatewayAttempts: paymentGatewayAttempts,
-		PaymentGatewayProvider: paymentGatewayProvider,
-		HTTPRateLimit:          httpRateLimit,
-		HTTPRateBurst:          httpRateBurst,
-		HTTPMaxBodyBytes:       int64(httpMaxBodyBytes),
-		OutboxRetention:        outboxRetention,
-		IdempotencyRetention:   idempotencyRetention,
-		RetentionInterval:      retentionInterval,
-		RetentionBatchSize:     retentionBatchSize,
-		OutboxPollInterval:     outboxPollInterval,
-		PaymentFailureRate:     paymentFailureRate,
-		PaymentTransientRate:   paymentTransientRate,
-		PaymentLatency:         paymentLatency,
-		RecoveryInterval:       recoveryInterval,
-		OrderPaymentTimeout:    orderPaymentTimeout,
-		PaymentRetryAfter:      paymentRetryAfter,
-		PaymentMaxRecovery:     paymentMaxRecovery,
-		APIKeys:                map[string]identity.Identity{},
+		AppEnv:                  appEnv,
+		HTTPAddr:                env("HTTP_ADDR", ":8080"),
+		DatabaseURL:             databaseURL,
+		RedisAddr:               redisAddr,
+		AuthMode:                authMode,
+		OIDCIssuer:              oidcIssuer,
+		OIDCAudience:            oidcAudience,
+		KafkaBrokers:            strings.Split(kafkaBrokers, ","),
+		KafkaTopic:              kafkaTopic,
+		KafkaDLQTopic:           strings.TrimSpace(env("KAFKA_DLQ_TOPIC", kafkaTopic+".dead-letter")),
+		KafkaGroupID:            env("KAFKA_GROUP_ID", "order-processing"),
+		KafkaPartitions:         kafkaPartitions,
+		MetricsToken:            strings.TrimSpace(os.Getenv("METRICS_TOKEN")),
+		RunWorkers:              runWorkers,
+		PaymentConsumerWorkers:  paymentConsumerWorkers,
+		PaymentGatewayAttempts:  paymentGatewayAttempts,
+		PaymentGatewayProvider:  paymentGatewayProvider,
+		PaymentProviderBaseURL:  paymentProviderBaseURL,
+		PaymentProviderClientID: paymentProviderClientID,
+		PaymentProviderSecret:   paymentProviderSecret,
+		HTTPRateLimit:           httpRateLimit,
+		HTTPRateBurst:           httpRateBurst,
+		HTTPMaxBodyBytes:        int64(httpMaxBodyBytes),
+		OutboxRetention:         outboxRetention,
+		IdempotencyRetention:    idempotencyRetention,
+		RetentionInterval:       retentionInterval,
+		RetentionBatchSize:      retentionBatchSize,
+		OutboxPollInterval:      outboxPollInterval,
+		PaymentFailureRate:      paymentFailureRate,
+		PaymentTransientRate:    paymentTransientRate,
+		PaymentLatency:          paymentLatency,
+		RecoveryInterval:        recoveryInterval,
+		OrderPaymentTimeout:     orderPaymentTimeout,
+		PaymentRetryAfter:       paymentRetryAfter,
+		PaymentMaxRecovery:      paymentMaxRecovery,
+		APIKeys:                 map[string]identity.Identity{},
 	}
 
 	for i, broker := range c.KafkaBrokers {
@@ -229,7 +256,7 @@ func Load() (*Config, error) {
 		}
 		c.APIKeys[key] = id
 	}
-	if len(c.APIKeys) == 0 {
+	if c.AuthMode == "api_key" && len(c.APIKeys) == 0 {
 		return nil, fmt.Errorf("API_KEYS must contain at least one key:tenant:user:role entry")
 	}
 	if err := c.validate(); err != nil {
@@ -308,9 +335,25 @@ func (c *Config) validate() error {
 	if c.RetentionBatchSize < 1 {
 		return fmt.Errorf("RETENTION_BATCH_SIZE must be at least 1")
 	}
+	if c.AuthMode == "oidc" {
+		if c.OIDCIssuer == "" {
+			return fmt.Errorf("OIDC_ISSUER is required when AUTH_MODE=oidc")
+		}
+		if c.OIDCAudience == "" {
+			return fmt.Errorf("OIDC_AUDIENCE is required when AUTH_MODE=oidc")
+		}
+	}
 	if c.AppEnv == "production" {
 		if c.PaymentGatewayProvider == payment.ProviderSimulated {
 			return fmt.Errorf("PAYMENT_GATEWAY_PROVIDER=simulated is not allowed in production")
+		}
+		if c.PaymentGatewayProvider == payment.ProviderPayPal {
+			if c.PaymentProviderClientID == "" {
+				return fmt.Errorf("PAYMENT_PROVIDER_CLIENT_ID is required for PayPal")
+			}
+			if c.PaymentProviderSecret == "" {
+				return fmt.Errorf("PAYMENT_PROVIDER_SECRET is required for PayPal")
+			}
 		}
 		databaseURL, err := url.Parse(c.DatabaseURL)
 		if err != nil || (databaseURL.Scheme != "postgres" && databaseURL.Scheme != "postgresql") || databaseURL.Host == "" {
@@ -322,9 +365,11 @@ func (c *Config) validate() error {
 				return fmt.Errorf("DATABASE_URL must not use the development database credentials in production")
 			}
 		}
-		for key := range c.APIKeys {
-			if len(key) < 32 {
-				return fmt.Errorf("production API_KEYS entries must be at least 32 characters")
+		if c.AuthMode == "api_key" {
+			for key := range c.APIKeys {
+				if len(key) < 32 {
+					return fmt.Errorf("production API_KEYS entries must be at least 32 characters")
+				}
 			}
 		}
 		if len(c.MetricsToken) < 32 {
