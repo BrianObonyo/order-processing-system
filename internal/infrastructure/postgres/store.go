@@ -52,8 +52,8 @@ func (s *Store) GetOrderForTenant(ctx context.Context, tenantID, id string) (*or
 	return repositories.New(s.pool).GetOrderForTenant(ctx, tenantID, id)
 }
 
-func (s *Store) ListOrders(ctx context.Context, tenantID, userID string, limit, offset int) ([]*order.Order, int64, error) {
-	return repositories.New(s.pool).ListOrders(ctx, tenantID, userID, limit, offset)
+func (s *Store) ListOrders(ctx context.Context, tenantID, userID string, status order.Status, limit, offset int) ([]*order.Order, int64, error) {
+	return repositories.New(s.pool).ListOrders(ctx, tenantID, userID, status, limit, offset)
 }
 
 func (s *Store) ListProductStock(ctx context.Context, tenantID string) ([]inventory.ProductStock, error) {

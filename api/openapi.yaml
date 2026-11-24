@@ -25,9 +25,13 @@ paths:
         - in: query
           name: page_size
           schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING_PAYMENT, PAID, CANCELLED] }
+          description: Optional filter by order status.
       responses:
         "200": { description: Page of orders, content: { application/json: { schema: { $ref: "#/components/schemas/OrderPage" } } } }
-        "400": { description: Invalid pagination values }
+        "400": { description: Invalid pagination or status values }
     post:
       summary: Create an order
       description: Idempotent. Repeating a request with the same Idempotency-Key and body returns the original order.
@@ -89,10 +93,14 @@ paths:
         - in: query
           name: page_size
           schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING_PAYMENT, PAID, CANCELLED] }
+          description: Optional filter by order status.
       responses:
         "200": { description: Tenant order page, content: { application/json: { schema: { $ref: "#/components/schemas/OrderPage" } } } }
         "403": { description: Admin role required }
-        "400": { description: Invalid pagination values }
+        "400": { description: Invalid pagination or status values }
   /api/v1/admin/orders/{id}:
     get:
       summary: Get an order within the authenticated tenant

@@ -162,19 +162,33 @@ func TestListOrdersPaginatesAndScopesToUser(t *testing.T) {
 		}
 	}
 
-	firstPage, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 1, 2)
+	firstPage, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 1, 2, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstPage.Total != 3 || len(firstPage.Orders) != 2 || firstPage.Page != 1 {
 		t.Fatalf("first page=%+v, want total 3 and 2 orders", firstPage)
 	}
-	secondPage, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 2, 2)
+	secondPage, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 2, 2, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if secondPage.Total != 3 || len(secondPage.Orders) != 1 || secondPage.Page != 2 {
 		t.Fatalf("second page=%+v, want total 3 and 1 order", secondPage)
+	}
+	pendingOnly, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 1, 10, order.StatusPendingPayment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pendingOnly.Total != 3 || len(pendingOnly.Orders) != 3 {
+		t.Fatalf("pending-only page=%+v, want total 3", pendingOnly)
+	}
+	paidOnly, err := orders.ListOrders(context.Background(), testutil.UserIdentity("user-1"), 1, 10, order.StatusPaid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paidOnly.Total != 0 || len(paidOnly.Orders) != 0 {
+		t.Fatalf("paid-only page=%+v, want empty result", paidOnly)
 	}
 	for _, listed := range append(firstPage.Orders, secondPage.Orders...) {
 		if listed.UserID != "user-1" {
@@ -248,11 +262,11 @@ func TestTenantIsolationAcrossCatalogOrdersAndIdempotency(t *testing.T) {
 		t.Fatalf("product lists crossed tenant boundary: alpha=%+v beta=%+v", alphaProducts, betaProducts)
 	}
 
-	alphaPage, err := orders.ListOrders(context.Background(), alphaAdmin, 1, 10)
+	alphaPage, err := orders.ListOrders(context.Background(), alphaAdmin, 1, 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	betaPage, err := orders.ListOrders(context.Background(), testutil.AdminIdentity("tenant-beta", "admin-2"), 1, 10)
+	betaPage, err := orders.ListOrders(context.Background(), testutil.AdminIdentity("tenant-beta", "admin-2"), 1, 10, "")
 	if err != nil {
 		t.Fatal(err)
 	}

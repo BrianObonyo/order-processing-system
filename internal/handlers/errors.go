@@ -32,6 +32,8 @@ func handleServiceError(c *gin.Context, err error) {
 		respondError(c, http.StatusUnprocessableEntity, "unknown_product", err.Error())
 	case errors.Is(err, order.ErrInvalidItems):
 		respondError(c, http.StatusBadRequest, "invalid_items", err.Error())
+	case errors.Is(err, order.ErrInvalidStatus):
+		respondError(c, http.StatusBadRequest, "invalid_status", "status must be one of PENDING_PAYMENT, PAID, CANCELLED")
 	case errors.Is(err, order.ErrIdempotencyMismatch):
 		respondError(c, http.StatusUnprocessableEntity, "idempotency_key_reuse", err.Error())
 	case errors.Is(err, order.ErrNotFound):

@@ -15,7 +15,7 @@ type Repository interface {
 	WithinTransaction(context.Context, func(Transaction) error) error
 	GetOrder(context.Context, string) (*order.Order, error)
 	GetOrderForTenant(context.Context, string, string) (*order.Order, error)
-	ListOrders(context.Context, string, string, int, int) ([]*order.Order, int64, error)
+	ListOrders(context.Context, string, string, order.Status, int, int) ([]*order.Order, int64, error)
 	ListProductStock(context.Context, string) ([]inventory.ProductStock, error)
 	GetPaymentByID(context.Context, string) (*payment.Payment, error)
 	TouchPendingRefund(context.Context, string) error

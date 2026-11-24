@@ -21,8 +21,18 @@ var (
 	ErrNotFound            = errors.New("order not found")
 	ErrInvalidItems        = errors.New("invalid order items")
 	ErrInvalidTransition   = errors.New("invalid order status transition")
+	ErrInvalidStatus       = errors.New("invalid order status")
 	ErrIdempotencyMismatch = errors.New("idempotency key was already used with a different request")
 )
+
+func ParseStatus(s string) (Status, error) {
+	switch Status(s) {
+	case StatusPendingPayment, StatusPaid, StatusCancelled:
+		return Status(s), nil
+	default:
+		return "", ErrInvalidStatus
+	}
+}
 
 var transitions = map[Status]map[Status]struct{}{
 	StatusPendingPayment: {

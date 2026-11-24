@@ -66,6 +66,7 @@ type orderAPIFake struct {
 	listActor   identity.Identity
 	page        int
 	pageSize    int
+	listStatus  order.Status
 	cancelActor identity.Identity
 	cancelID    string
 }
@@ -86,8 +87,9 @@ func (*orderAPIFake) CreateOrder(context.Context, identity.Identity, string, []o
 func (*orderAPIFake) GetOrder(context.Context, identity.Identity, string) (*order.Order, error) {
 	return nil, nil
 }
-func (f *orderAPIFake) ListOrders(_ context.Context, actor identity.Identity, page, pageSize int) (*services.OrderPage, error) {
+func (f *orderAPIFake) ListOrders(_ context.Context, actor identity.Identity, page, pageSize int, status order.Status) (*services.OrderPage, error) {
 	f.listActor, f.page, f.pageSize = actor, page, pageSize
+	f.listStatus = status
 	return &services.OrderPage{Orders: []*order.Order{}, Page: page, PageSize: pageSize}, nil
 }
 func (f *orderAPIFake) CancelOrder(_ context.Context, actor identity.Identity, id string) error {
@@ -121,8 +123,24 @@ func TestOrderListPaginationAndAuthentication(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
 	if fake.listActor != (identity.Identity{TenantID: "default", UserID: "user-1", Role: identity.RoleUser}) ||
-		fake.page != 2 || fake.pageSize != 5 {
-		t.Fatalf("list args=(%+v,%d,%d), want user identity and page 2/5", fake.listActor, fake.page, fake.pageSize)
+		fake.page != 2 || fake.pageSize != 5 || fake.listStatus != "" {
+		t.Fatalf("list args=(%+v,%d,%d,%q), want user identity, page 2/5 and empty status", fake.listActor, fake.page, fake.pageSize, fake.listStatus)
+	}
+
+	filtered := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/orders?status=PAID", nil)
+	request.Header.Set("X-API-Key", "test-key")
+	router.ServeHTTP(filtered, request)
+	if filtered.Code != http.StatusOK || fake.listStatus != order.StatusPaid {
+		t.Fatalf("status filter response=%d status=%q, want 200 and PAID", filtered.Code, fake.listStatus)
+	}
+
+	badStatus := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/orders?status=SHIPPED", nil)
+	request.Header.Set("X-API-Key", "test-key")
+	router.ServeHTTP(badStatus, request)
+	if badStatus.Code != http.StatusBadRequest {
+		t.Fatalf("invalid status response=%d, want 400", badStatus.Code)
 	}
 
 	badPage := httptest.NewRecorder()

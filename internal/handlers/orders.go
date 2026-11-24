@@ -18,7 +18,7 @@ import (
 type OrderAPI interface {
 	CreateOrder(context.Context, identity.Identity, string, []order.CreateItem) (*services.CreateOrderResult, error)
 	GetOrder(context.Context, identity.Identity, string) (*order.Order, error)
-	ListOrders(context.Context, identity.Identity, int, int) (*services.OrderPage, error)
+	ListOrders(context.Context, identity.Identity, int, int, order.Status) (*services.OrderPage, error)
 	CancelOrder(context.Context, identity.Identity, string) error
 }
 
@@ -80,7 +80,16 @@ func (h *OrderHandler) List(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.svc.ListOrders(c.Request.Context(), middleware.RequestIdentity(c), page, pageSize)
+	var status order.Status
+	if raw := c.Query("status"); raw != "" {
+		parsed, err := order.ParseStatus(raw)
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "invalid_status", "status must be one of PENDING_PAYMENT, PAID, CANCELLED")
+			return
+		}
+		status = parsed
+	}
+	result, err := h.svc.ListOrders(c.Request.Context(), middleware.RequestIdentity(c), page, pageSize, status)
 	if err != nil {
 		handleServiceError(c, err)
 		return

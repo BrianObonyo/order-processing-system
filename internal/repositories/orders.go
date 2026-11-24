@@ -72,19 +72,20 @@ func (q *Queries) GetOrderForTenant(ctx context.Context, tenantID, id string) (*
 	return o, err
 }
 
-// ListOrders returns one user's orders, newest first, with a stable tie-breaker.
-func (q *Queries) ListOrders(ctx context.Context, tenantID, userID string, limit, offset int) ([]*order.Order, int64, error) {
+// ListOrders returns orders for a tenant, optionally scoped to a user and status, newest first.
+func (q *Queries) ListOrders(ctx context.Context, tenantID, userID string, status order.Status, limit, offset int) ([]*order.Order, int64, error) {
 	var total int64
 	if err := q.db.QueryRow(ctx, `
-		SELECT count(*) FROM orders WHERE tenant_id = $1 AND ($2 = '' OR user_id = $2)`,
-		tenantID, userID).Scan(&total); err != nil {
+		SELECT count(*) FROM orders
+		WHERE tenant_id = $1 AND ($2 = '' OR user_id = $2) AND ($3 = '' OR status = $3)`,
+		tenantID, userID, string(status)).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
 	rows, err := q.db.Query(ctx, selectOrder+`
-		WHERE tenant_id = $1 AND ($2 = '' OR user_id = $2)
+		WHERE tenant_id = $1 AND ($2 = '' OR user_id = $2) AND ($3 = '' OR status = $3)
 		ORDER BY created_at DESC, id DESC
-		LIMIT $3 OFFSET $4`, tenantID, userID, limit, offset)
+		LIMIT $4 OFFSET $5`, tenantID, userID, string(status), limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}

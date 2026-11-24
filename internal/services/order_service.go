@@ -176,19 +176,24 @@ func (s *OrderService) GetOrder(ctx context.Context, actor identity.Identity, id
 	return o, nil
 }
 
-func (s *OrderService) ListOrders(ctx context.Context, actor identity.Identity, page, pageSize int) (*OrderPage, error) {
+func (s *OrderService) ListOrders(ctx context.Context, actor identity.Identity, page, pageSize int, status order.Status) (*OrderPage, error) {
 	if !actor.IsValid() {
 		return nil, identity.ErrInvalid
 	}
 	if page < 1 || pageSize < 1 || pageSize > 100 || page-1 > int(^uint(0)>>1)/pageSize {
 		return nil, ErrInvalidPagination
 	}
+	if status != "" {
+		if _, err := order.ParseStatus(string(status)); err != nil {
+			return nil, err
+		}
+	}
 	offset := (page - 1) * pageSize
 	userID := actor.UserID
 	if actor.Role == identity.RoleAdmin {
 		userID = ""
 	}
-	orders, total, err := s.repository.ListOrders(ctx, actor.TenantID, userID, pageSize, offset)
+	orders, total, err := s.repository.ListOrders(ctx, actor.TenantID, userID, status, pageSize, offset)
 	if err != nil {
 		return nil, err
 	}
